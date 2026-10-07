@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/data2/jjyeung/envs/miniforge3/bin/python -I
 """Durable two-way messages between an orchestrator and its Devin or Codex lanes.
 
 Each lane owns a mailbox, `<lane dir>/mail`, with two Maildir-style queues: `inbox/` (orchestrator to lane)
@@ -10,16 +10,21 @@ message and exactly one reader claims each message.
 Delivery is pushed both ways. Devin lanes receive messages through hooks (`lanemsg.py hook <Event>`, wired by
 `.devin/hooks.v1.json` or the user's Devin config): SessionStart, UserPromptSubmit and PostToolUse put new
 messages into the lane's context, and Stop keeps the lane working while a message is undelivered or a question
-from the orchestrator is unanswered. Messages for the orchestrator go to its session on the host where that
-session runs: a Claude Code session through its inbox socket, a Codex session through the host's Codex
-app-server daemon, which steers the message into the running turn or queues it as the next turn. A lane on
-another host relays the push over ssh. A push that fails is retried with the lane's next message, by
-`lanemsg adopt`, or by the lane's launcher. Codex lanes have no hooks and run `lanemsg.py inbox` between work
-steps.
+from the orchestrator is unanswered. Messages for the orchestrator go to the session that registered or
+launched the lane, on the host where that session runs: a Claude Code session through its inbox socket, a Codex
+session through the host's Codex app-server daemon. In Codex, the thread that launched the lane, a subagent or
+the main session, gets each message steered into its running turn, and an answer goes first to the thread that
+asked the question. When that thread runs no turn, the main session gets the message, steered into its running
+turn or queued as its next turn. A lane on another host relays the push over ssh. A push that fails is retried
+with the lane's next message, by `lanemsg adopt`, or by the lane's launcher. Codex lanes have no hooks and run
+`lanemsg inbox` between work steps.
 
 `lanemsg run` (or any launcher) puts the lane identity (LANEMSG_DIR, LANEMSG_ATTEMPT) in each attempt's
 environment. The hooks bind an attempt to the first Devin session that reports in, so nested Devin processes
 that inherit the environment cannot consume the lane's messages.
+
+The defaults fit the Trinity cluster: the registry and lane folders live under /data2/jjyeung/lanemsg, and the
+script and its hooks run /data2/jjyeung/envs/miniforge3/bin/python.
 """
 from __future__ import annotations
 
@@ -52,6 +57,8 @@ SUBAGENT_TOOLS = (SUBAGENT_TOOL, "read_subagent")
 BACKGROUND_SUBAGENT_HOLD_S = 600
 FOREGROUND_SUBAGENT_HOLD_S = 3 * 3600
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+DATA_ROOT = Path("/data2/jjyeung/lanemsg")
+PYTHON = "/data2/jjyeung/envs/miniforge3/bin/python"
 
 
 class LaneError(Exception):
@@ -59,12 +66,11 @@ class LaneError(Exception):
 
 
 def runs_root() -> Path:
-    return Path(os.environ.get("LANEMSG_RUNS_ROOT") or Path.home())
+    return Path(os.environ.get("LANEMSG_RUNS_ROOT") or DATA_ROOT / "lanes")
 
 
 def registry() -> Path:
-    state = os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state"
-    return Path(os.environ.get("LANEMSG_REGISTRY") or Path(state) / "lanemsg" / "lanes")
+    return Path(os.environ.get("LANEMSG_REGISTRY") or DATA_ROOT / "registry")
 
 
 def claude_sessions() -> Path:
@@ -112,13 +118,11 @@ def clip(text: str, limit: int = BODY_LIMIT) -> str:
 
 @functools.lru_cache(maxsize=1)
 def command() -> str:
-    """How agents invoke this script: `lanemsg` when that name on PATH runs this file (a symlink to it, or a small
-    wrapper script that names it), otherwise this interpreter and this file."""
+    """How agents invoke this script: `lanemsg` when that name on PATH resolves to this file, otherwise this
+    interpreter and this file."""
     on_path = shutil.which("lanemsg")
-    if on_path:
-        path = Path(on_path)
-        if path.resolve() == SELF or (path.stat().st_size < 4096 and str(SELF) in path.read_text(errors="ignore")):
-            return "lanemsg"
+    if on_path and Path(on_path).resolve() == SELF:
+        return "lanemsg"
     return f"{shlex.quote(sys.executable)} {shlex.quote(str(SELF))}"
 
 
@@ -289,31 +293,63 @@ def codex_app_server(timeout: float = 10.0):
             yield request
 
 
-def post_to_codex(target: dict, text: str, message_id: str) -> str:
-    """Steer the message into the Codex session's running turn. When no turn is running, queue it as the session's
-    next turn, which the app-server starts at once."""
-    thread, entry = target["session_id"], [{"type": "text", "text": text}]
+def read_thread(request, thread: str) -> dict:
+    return request("thread/read", {"threadId": thread}).get("thread") or {}
+
+
+def steer(request, thread: str, text: str, message_id: str) -> bool:
+    """Steer the text into the thread's running turn; False when the thread runs no turn, the turn ended meanwhile,
+    or the app-server does not know the thread."""
+    try:
+        if (read_thread(request, thread).get("status") or {}).get("type") != "active":
+            return False
+        turn = (request("thread/turns/list", {"threadId": thread, "limit": 1}).get("data") or [{}])[0]
+        if turn.get("status") != "inProgress":
+            return False
+        request("turn/steer", {"threadId": thread, "expectedTurnId": turn.get("id"),
+                               "input": [{"type": "text", "text": text}], "clientUserMessageId": message_id})
+        return True
+    except OSError:
+        return False
+
+
+def thread_label(request, thread: str) -> str:
+    """How the main session knows the thread: a subagent's path and nickname; the source of other threads is a
+    plain string such as "cli"."""
+    try:
+        source = read_thread(request, thread).get("source")
+    except OSError:
+        source = None
+    spawn = ((source.get("subAgent") or {}).get("thread_spawn") or {}) if isinstance(source, dict) else {}
+    nickname = f" ({spawn['agent_nickname']})" if spawn.get("agent_nickname") else ""
+    return f"subagent {spawn['agent_path']}{nickname}" if spawn.get("agent_path") else f"thread {thread}"
+
+
+def post_to_codex(target: dict, text: str, message_id: str, threads=()) -> str:
+    """Steer the message into the running turn of the first of `threads`, the session's threads that should get it,
+    that runs one. Otherwise the main session gets it, with a note naming the intended thread: steered into its
+    running turn, or queued as its next turn, which the app-server starts at once."""
+    session = target["session_id"]
     with codex_app_server() as request:
-        status = ((request("thread/read", {"threadId": thread}).get("thread") or {}).get("status") or {}).get("type")
-        if status == "active":
-            turns = request("thread/turns/list", {"threadId": thread, "limit": 1}).get("data") or [{}]
-            if turns[0].get("status") == "inProgress":
-                try:
-                    request("turn/steer", {"threadId": thread, "expectedTurnId": turns[0].get("id"), "input": entry,
-                                           "clientUserMessageId": message_id})
-                    return f"steered into the running turn of Codex session {thread}"
-                except OSError:
-                    pass
-        elif status != "idle":
-            raise OSError(f"Codex session {thread} is {status or 'unknown'} on {socket.gethostname()}")
-        request("thread/queue/add", {"threadId": thread, "input": entry, "clientUserMessageId": message_id})
-        return f"queued as the next turn of Codex session {thread}"
+        for thread in threads:
+            if steer(request, thread, text, message_id):
+                return f"steered into the running turn of Codex thread {thread}"
+        if threads:
+            text += f"\n(lanemsg: meant for your {thread_label(request, threads[0])}, which runs no turn now.)"
+        status = (read_thread(request, session).get("status") or {}).get("type")
+        if status == "active" and steer(request, session, text, message_id):
+            return f"steered into the running turn of Codex session {session}"
+        if status not in ("active", "idle"):
+            raise OSError(f"Codex session {session} is {status or 'unknown'} on {socket.gethostname()}")
+        request("thread/queue/add", {"threadId": session, "input": [{"type": "text", "text": text}],
+                                     "clientUserMessageId": message_id})
+        return f"queued as the next turn of Codex session {session}"
 
 
-def post_to_orchestrator(target: dict, text: str, message_id: str) -> str:
+def post_to_orchestrator(target: dict, text: str, message_id: str, threads=()) -> str:
     """Deliver one message to the orchestrator's session, which must run on this host."""
     if target.get("agent") == "codex":
-        return post_to_codex(target, text, message_id)
+        return post_to_codex(target, text, message_id, threads)
     sock = claude_socket(target)
     if not sock:
         raise OSError(f"no live Claude session on {socket.gethostname()} is registered as this lane's orchestrator")
@@ -512,7 +548,7 @@ class Mailbox:
         return read_json(self.path / "orchestrator.json")
 
     def set_orchestrator(self, target: dict, how: str) -> None:
-        target = {key: target[key] for key in ("agent", "session_id", "name", "host") if target.get(key)}
+        target = {key: target[key] for key in ("agent", "session_id", "thread_id", "name", "host") if target.get(key)}
         current = self.orchestrator() or {}
         if all(current.get(key) == value for key, value in target.items()):
             return
@@ -541,6 +577,16 @@ class Mailbox:
         return [message for _, message in self.list("outbox") if message["kind"] == "ask"]
 
 
+def recipient_threads(mailbox: Mailbox, message: dict, target: dict) -> list:
+    """Threads of the orchestrator's session that should get the message before its main thread does: the thread
+    that asked the question the message answers, then the thread that launched the lane."""
+    asked = mailbox.find(message["reply_to"]) if message.get("reply_to") else None
+    asker = (asked[2].get("sender") or {}) if asked else {}
+    threads = [asker.get("thread_id") if asker.get("session_id") == target.get("session_id") else None,
+               target.get("thread_id")]
+    return [thread for thread in dict.fromkeys(threads) if thread and thread != target.get("session_id")]
+
+
 def push_pending(mailbox: Mailbox, min_age_s: float = 0.0, relay: bool = True) -> list:
     """Post the lane's undelivered messages to its orchestrator's session; returns the ids it posted. When the
     orchestrator runs on another host, the push runs there over ssh. The first failed push of a message also
@@ -565,7 +611,8 @@ def push_pending(mailbox: Mailbox, min_age_s: float = 0.0, relay: bool = True) -
             try:
                 if relay_error or not target:
                     raise relay_error or OSError("no orchestrator session is registered for this lane")
-                response = post_to_orchestrator(target, format_for_orchestrator(message, mailbox), message["id"])
+                response = post_to_orchestrator(target, format_for_orchestrator(message, mailbox), message["id"],
+                                                recipient_threads(mailbox, message, target))
             except OSError as exc:
                 if message["id"] not in failures:
                     copy = mailbox.path.parent / f"TO_ORCHESTRATOR_{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_" \
@@ -865,11 +912,12 @@ def lane_sender(mailbox: Mailbox, attempt) -> dict:
 
 
 def orchestrator_sender(mailbox: Mailbox) -> dict:
+    """The writing session. A different session that writes to the lane takes it over; within one session the
+    lane keeps the thread that launched it."""
     session = orchestrator_ancestor()
-    if session:
+    if session and (mailbox.orchestrator() or {}).get("session_id") != session["session_id"]:
         mailbox.set_orchestrator(session, "orchestrator wrote to the lane")
-        return session
-    return {"agent": "other", "host": socket.gethostname(), "pid": os.getppid()}
+    return session or {"agent": "other", "host": socket.gethostname(), "pid": os.getppid()}
 
 
 def body_from(words: list) -> str:
@@ -1025,7 +1073,7 @@ def cmd_lanes(args) -> str:
 def hooks_config() -> dict:
     """Generic Devin hooks: they run only in processes whose environment names a lane (set by its launcher)."""
     def entry(event: str, matcher: str = "") -> list:
-        script = f'test -n "$LANEMSG_HOOK" || exit 0; exec "${{LANEMSG_PYTHON:-python3}}" -I "$LANEMSG_HOOK" hook {event}'
+        script = f'test -n "$LANEMSG_HOOK" || exit 0; exec "${{LANEMSG_PYTHON:-{PYTHON}}}" -I "$LANEMSG_HOOK" hook {event}'
         return [{"matcher": matcher, "hooks": [{"type": "command", "command": f"sh -c {shlex.quote(script)}",
                                                 "timeout": 30}]}]
     config = {event: entry(event) for event in ("SessionStart", "UserPromptSubmit", "PostToolUse", "Stop",
@@ -1061,7 +1109,7 @@ def cmd_adopt(args) -> str:
 
 
 def cmd_register(args) -> str:
-    lane_dir = Path(args.lane_dir).resolve()
+    lane_dir = (runs_root() / args.lane_dir).resolve()
     lane_dir.mkdir(parents=True, exist_ok=True)
     mailbox = register_lane(lane_dir, args.name or lane_dir.name, Path(args.run_root or lane_dir.parent))
     session = parse_target(args.session) if args.session else orchestrator_ancestor()
@@ -1081,6 +1129,9 @@ def cmd_run(args) -> str:
     mailbox, executable = resolve_lane(args.lane), shutil.which(argv[0])
     if not executable:
         raise LaneError(f"cannot run {argv[0]}: no such executable")
+    launcher = orchestrator_ancestor()
+    if launcher:
+        mailbox.set_orchestrator(launcher, "run")
     attempt, engine = mailbox.reserve_attempt(), "codex" if Path(argv[0]).name == "codex" else "devin"
     mailbox.log("launched", attempt=str(attempt), engine=engine, host=socket.gethostname(), argv=argv)
     env = {**os.environ, "LANEMSG_DIR": str(mailbox.path.resolve()), "LANEMSG_ATTEMPT": str(attempt),
@@ -1123,7 +1174,7 @@ def main(argv=None) -> int:
     sub = commands.add_parser("lanes", help="list registered lanes")
     sub.add_argument("--all", action="store_true")
     sub = commands.add_parser("register", help="create a lane's mailbox; the calling session becomes its orchestrator")
-    sub.add_argument("lane_dir")
+    sub.add_argument("lane_dir", help=f"lane directory; a relative path goes under the lanes root, {runs_root()}")
     sub.add_argument("--name", help="short lane name (default: the directory's name)")
     sub.add_argument("--run-root", help="directory that holds the run's lanes (default: the lane directory's parent)")
     sub.add_argument("--session", help="orchestrator session, when register does not run inside it: "

@@ -92,7 +92,7 @@ def fake_codex():
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(sock_path)
     server.listen()
-    daemon = {"status": "idle", "turn": {"id": "turn-1", "status": "inProgress"}, "steer_error": None, "calls": []}
+    daemon = {"threads": {CODEX_ID: "idle"}, "sources": {}, "steer_error": None, "calls": []}
 
     def handle(connection):
         with connection, connection.makefile("rb") as stream:
@@ -112,8 +112,13 @@ def fake_codex():
                     continue
                 daemon["calls"].append((request["method"], request["params"]))
                 lanemsg.websocket_send(connection, json.dumps({"method": "configWarning", "params": {}}), masked=False)
-                result = {"thread/read": {"thread": {"status": {"type": daemon["status"]}}},
-                          "thread/turns/list": {"data": [daemon["turn"]]}}.get(request["method"], {})
+                thread = request["params"].get("threadId")
+                status = daemon["threads"].get(thread, "notLoaded")
+                result = {"thread/read": {"thread": {"id": thread, "status": {"type": status},
+                                                     "source": daemon["sources"].get(thread, "cli")}},
+                          "thread/turns/list": {"data": [{"id": f"turn-of-{thread}", "status": "inProgress"
+                                                          if status == "active" else "completed"}]},
+                          }.get(request["method"], {})
                 reply = {"id": request["id"], "result": result}
                 if request["method"] == "turn/steer" and daemon["steer_error"]:
                     reply = {"id": request["id"], "error": {"code": -32600, "message": daemon["steer_error"]}}
@@ -401,16 +406,16 @@ def test_example_hooks_file_matches_what_install_hooks_writes():
     assert json.loads((REPO / "examples" / "hooks.v1.json").read_text()) == lanemsg.hooks_config()
 
 
-def test_default_locations_are_per_user(tmp_path, monkeypatch):
-    for key in ("LANEMSG_RUNS_ROOT", "LANEMSG_REGISTRY", "LANEMSG_CLAUDE_SESSIONS"):
+def test_default_locations_are_on_the_trinity_data_directory(tmp_path, monkeypatch):
+    for key in ("LANEMSG_RUNS_ROOT", "LANEMSG_REGISTRY", "LANEMSG_CLAUDE_SESSIONS", "CODEX_HOME"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-    assert lanemsg.runs_root() == tmp_path / "home"
-    assert lanemsg.registry() == tmp_path / "state" / "lanemsg" / "lanes"
+    assert lanemsg.runs_root() == Path("/data2/jjyeung/lanemsg/lanes")
+    assert lanemsg.registry() == Path("/data2/jjyeung/lanemsg/registry")
     assert lanemsg.claude_sessions() == tmp_path / "home" / ".claude" / "sessions"
-    monkeypatch.delenv("XDG_STATE_HOME")
-    assert lanemsg.registry() == tmp_path / "home" / ".local" / "state" / "lanemsg" / "lanes"
+    assert lanemsg.codex_home() == tmp_path / "home" / ".codex"
+    command = lanemsg.hooks_config()["Stop"][0]["hooks"][0]["command"]
+    assert "${LANEMSG_PYTHON:-/data2/jjyeung/envs/miniforge3/bin/python}" in command
 
 
 def test_hook_failures_never_break_the_lane(lane, monkeypatch, capsys):
@@ -525,19 +530,19 @@ def test_lane_messages_queue_as_the_next_turn_of_an_idle_codex_session(lane, mon
 
 
 def test_lane_questions_steer_into_the_running_turn_of_a_codex_session(lane, monkeypatch, capsys, fake_codex):
-    fake_codex["status"] = "active"
+    fake_codex["threads"][CODEX_ID] = "active"
     mailbox = lane()
     codex_orchestrator(mailbox)
     as_lane(monkeypatch, mailbox)
     assert cli(capsys, "ask", "may I use 8 GPUs?")[0] == 0
     method, params = fake_codex["calls"][-1]
-    assert method == "turn/steer" and params["expectedTurnId"] == "turn-1" and params["threadId"] == CODEX_ID
+    assert method == "turn/steer" and params["expectedTurnId"] == f"turn-of-{CODEX_ID}" and params["threadId"] == CODEX_ID
     assert "may I use 8 GPUs?" in params["input"][0]["text"] and len(names(mailbox, "outbox", "cur")) == 1
     assert "steered into the running turn" in last_event(mailbox)["response"]
 
 
 def test_a_turn_that_ends_before_the_steer_lands_gets_the_message_queued(lane, monkeypatch, capsys, fake_codex):
-    fake_codex.update(status="active", steer_error="expected turn turn-1 is not active")
+    fake_codex.update(threads={CODEX_ID: "active"}, steer_error="expected turn is not active")
     mailbox = lane()
     codex_orchestrator(mailbox)
     as_lane(monkeypatch, mailbox)
@@ -545,8 +550,46 @@ def test_a_turn_that_ends_before_the_steer_lands_gets_the_message_queued(lane, m
     assert [method for method, _ in fake_codex["calls"]][-2:] == ["turn/steer", "thread/queue/add"]
 
 
+def test_the_subagent_that_launched_a_lane_gets_its_messages_while_it_runs(lane, monkeypatch, capsys, fake_codex):
+    subagent = "01a1155d-e848-70c3-857e-e905d38e5ada"
+    fake_codex.update(threads={CODEX_ID: "active", subagent: "active"},
+                      sources={subagent: {"subAgent": {"thread_spawn": {"agent_path": "/root/devin_main_plan",
+                                                                        "agent_nickname": "Peirce"}}}})
+    mailbox = lane()
+    mailbox.set_orchestrator({"agent": "codex", "session_id": CODEX_ID, "thread_id": subagent,
+                              "host": socket.gethostname()}, "test")
+    as_lane(monkeypatch, mailbox)
+    assert "delivered" in cli(capsys, "send", "epoch 3 finished")[1]
+    method, params = fake_codex["calls"][-1]
+    assert method == "turn/steer" and params["threadId"] == subagent
+    fake_codex["threads"][subagent] = "idle"
+    assert "delivered" in cli(capsys, "send", "epoch 4 finished")[1]
+    method, params = fake_codex["calls"][-1]
+    assert method == "turn/steer" and params["threadId"] == CODEX_ID
+    assert "epoch 4 finished" in params["input"][0]["text"]
+    assert "meant for your subagent /root/devin_main_plan (Peirce), which runs no turn now" in params["input"][0]["text"]
+
+
+def test_an_answer_goes_to_the_thread_that_asked(lane, monkeypatch, capsys, fake_codex):
+    launcher, asker = "launcher-thread", "asking-thread"
+    fake_codex["threads"].update({CODEX_ID: "active", launcher: "active", asker: "active"})
+    mailbox = lane()
+    mailbox.set_orchestrator({"agent": "codex", "session_id": CODEX_ID, "thread_id": launcher,
+                              "host": socket.gethostname()}, "test")
+    monkeypatch.setenv("CODEX_SESSION_ID", CODEX_ID)
+    monkeypatch.setenv("CODEX_THREAD_ID", asker)
+    monkeypatch.setattr(lanemsg, "codex_process", lambda pid: pid == os.getppid())
+    cli(capsys, "ask", "alpha", "which seed?")
+    assert mailbox.orchestrator()["thread_id"] == launcher
+    question_id, = names(mailbox, "inbox", "new")
+    as_lane(monkeypatch, mailbox)
+    assert "delivered" in cli(capsys, "reply", question_id, "seed 7")[1]
+    method, params = fake_codex["calls"][-1]
+    assert method == "turn/steer" and params["threadId"] == asker and "seed 7" in params["input"][0]["text"]
+
+
 def test_messages_for_an_unreachable_codex_session_wait_in_the_outbox(lane, monkeypatch, capsys, fake_codex):
-    fake_codex["status"] = "notLoaded"
+    fake_codex["threads"].clear()
     mailbox = lane()
     codex_orchestrator(mailbox)
     as_lane(monkeypatch, mailbox)
@@ -586,9 +629,10 @@ def test_lanes_on_other_hosts_relay_the_push_to_the_orchestrators_host(lane, mon
 
 
 def test_register_records_the_calling_session_and_run_starts_numbered_attempts(tmp_path, capsys, fake_claude):
-    code, out, _ = cli(capsys, "register", str(tmp_path / "runs" / "r1" / "beta"))
+    code, out, _ = cli(capsys, "register", "r1/beta")
     assert code == 0 and "registered lane r1/beta" in out and "fake-orch" in out and " run r1/beta -- devin" in out
     mailbox = lanemsg.resolve_lane("beta")
+    assert mailbox.path == (tmp_path / "runs" / "r1" / "beta" / "mail").resolve()
     assert mailbox.orchestrator()["session_id"] == ORCHESTRATOR_ID
     probe = "import json, os; print(json.dumps({k: v for k, v in os.environ.items() if k.startswith('LANEMSG_')}))"
     first, second = (json.loads(subprocess.run(
@@ -623,16 +667,27 @@ def test_install_hooks_merges_into_the_devin_user_config(tmp_path, monkeypatch):
     assert {event: entries[-1:] for event, entries in config["hooks"].items()} == lanemsg.hooks_config()
 
 
-def test_instructions_name_lanemsg_when_the_command_on_path_runs_this_file(tmp_path, monkeypatch):
+def test_a_launch_inside_a_codex_thread_makes_that_thread_the_lanes_launcher(lane, monkeypatch, capsys):
+    mailbox = lane()
+    monkeypatch.setenv("CODEX_SESSION_ID", CODEX_ID)
+    monkeypatch.setenv("CODEX_THREAD_ID", "launching-subagent")
+    monkeypatch.setattr(lanemsg, "codex_process", lambda pid: pid == os.getppid())
+    launched = []
+    monkeypatch.setattr(lanemsg.os, "execve", lambda path, argv, env: launched.append((argv, env)))
+    cli(capsys, "run", "alpha", "--", "sh", "-c", "true")
+    argv, env = launched[0]
+    assert argv == ["sh", "-c", "true"] and env["LANEMSG_ATTEMPT"] == "1" and env["LANEMSG_ENGINE"] == "devin"
+    assert mailbox.orchestrator()["thread_id"] == "launching-subagent"
+
+
+def test_instructions_name_lanemsg_when_the_command_on_path_is_this_file(tmp_path, monkeypatch):
     (tmp_path / "bin").mkdir()
-    wrapper = tmp_path / "bin" / "lanemsg"
     monkeypatch.setenv("PATH", str(tmp_path / "bin"))
-    for target, expected in ((lanemsg.SELF, "lanemsg"), ("/elsewhere/lanemsg.py",
-                             f"{shlex.quote(sys.executable)} {shlex.quote(str(lanemsg.SELF))}")):
-        wrapper.write_text(f'#!/bin/sh\nexec /opt/python -I {target} "$@"\n')
-        wrapper.chmod(0o755)
-        lanemsg.command.cache_clear()
-        assert lanemsg.command() == expected
+    lanemsg.command.cache_clear()
+    assert lanemsg.command() == f"{shlex.quote(sys.executable)} {shlex.quote(str(lanemsg.SELF))}"
+    (tmp_path / "bin" / "lanemsg").symlink_to(lanemsg.SELF)
+    lanemsg.command.cache_clear()
+    assert lanemsg.command() == "lanemsg"
     lanemsg.command.cache_clear()
 
 
