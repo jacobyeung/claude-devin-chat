@@ -1,0 +1,74 @@
+{
+  "SessionStart": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "sh -c 'test -n \"$LANEMSG_HOOK\" || exit 0; exec \"${LANEMSG_PYTHON:-python3}\" -I \"$LANEMSG_HOOK\" hook SessionStart'",
+          "timeout": 30
+        }
+      ]
+    }
+  ],
+  "UserPromptSubmit": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "sh -c 'test -n \"$LANEMSG_HOOK\" || exit 0; exec \"${LANEMSG_PYTHON:-python3}\" -I \"$LANEMSG_HOOK\" hook UserPromptSubmit'",
+          "timeout": 30
+        }
+      ]
+    }
+  ],
+  "PostToolUse": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "sh -c 'test -n \"$LANEMSG_HOOK\" || exit 0; exec \"${LANEMSG_PYTHON:-python3}\" -I \"$LANEMSG_HOOK\" hook PostToolUse'",
+          "timeout": 30
+        }
+      ]
+    }
+  ],
+  "Stop": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "sh -c 'test -n \"$LANEMSG_HOOK\" || exit 0; exec \"${LANEMSG_PYTHON:-python3}\" -I \"$LANEMSG_HOOK\" hook Stop'",
+          "timeout": 30
+        }
+      ]
+    }
+  ],
+  "PostCompaction": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "sh -c 'test -n \"$LANEMSG_HOOK\" || exit 0; exec \"${LANEMSG_PYTHON:-python3}\" -I \"$LANEMSG_HOOK\" hook PostCompaction'",
+          "timeout": 30
+        }
+      ]
+    }
+  ],
+  "PreToolUse": [
+    {
+      "matcher": "^run_subagent$",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "sh -c 'test -n \"$LANEMSG_HOOK\" || exit 0; exec \"${LANEMSG_PYTHON:-python3}\" -I \"$LANEMSG_HOOK\" hook PreToolUse'",
+          "timeout": 30
+        }
+      ]
+    }
+  ]
+}
