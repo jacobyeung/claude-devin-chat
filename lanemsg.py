@@ -8,28 +8,34 @@ which is atomic within one filesystem (Lustre included), so a crash never leaves
 message and exactly one reader claims each message.
 
 Delivery is pushed both ways. Devin lanes receive messages through hooks (`lanemsg.py hook <Event>`, wired by
-`.devin/hooks.v1.json`): SessionStart, UserPromptSubmit and PostToolUse put new messages into the lane's
-context, and Stop keeps the lane working while a message is undelivered or a question from the orchestrator
-is unanswered. Messages for the orchestrator go to its Claude Code session's inbox socket; a push that fails
-is retried with the lane's next message, by `lanemsg adopt`, or by the lane's launcher. Codex lanes have no
-hooks and run `lanemsg.py inbox` between work steps.
+`.devin/hooks.v1.json` or the user's Devin config): SessionStart, UserPromptSubmit and PostToolUse put new
+messages into the lane's context, and Stop keeps the lane working while a message is undelivered or a question
+from the orchestrator is unanswered. Messages for the orchestrator go to its session on the host where that
+session runs: a Claude Code session through its inbox socket, a Codex session through the host's Codex
+app-server daemon, which steers the message into the running turn or queues it as the next turn. A lane on
+another host relays the push over ssh. A push that fails is retried with the lane's next message, by
+`lanemsg adopt`, or by the lane's launcher. Codex lanes have no hooks and run `lanemsg.py inbox` between work
+steps.
 
-Whatever launches a lane puts the lane identity (LANEMSG_DIR, LANEMSG_ATTEMPT) in each attempt's environment.
-The hooks bind an attempt to the first Devin session that reports in, so nested Devin processes that inherit
-the environment cannot consume the lane's messages.
+`lanemsg run` (or any launcher) puts the lane identity (LANEMSG_DIR, LANEMSG_ATTEMPT) in each attempt's
+environment. The hooks bind an attempt to the first Devin session that reports in, so nested Devin processes
+that inherit the environment cannot consume the lane's messages.
 """
 from __future__ import annotations
 
 import argparse
+import base64
 import fcntl
 import functools
 import hashlib
+import itertools
 import json
 import os
 import re
 import shlex
 import shutil
 import socket
+import subprocess
 import sys
 import time
 import traceback
@@ -45,6 +51,7 @@ SUBAGENT_TOOL = "run_subagent"
 SUBAGENT_TOOLS = (SUBAGENT_TOOL, "read_subagent")
 BACKGROUND_SUBAGENT_HOLD_S = 600
 FOREGROUND_SUBAGENT_HOLD_S = 3 * 3600
+WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
 class LaneError(Exception):
@@ -64,6 +71,14 @@ def claude_sessions() -> Path:
     return Path(os.environ.get("LANEMSG_CLAUDE_SESSIONS", str(Path.home() / ".claude" / "sessions")))
 
 
+def codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+
+
+def devin_user_config() -> Path:
+    return Path.home() / ".config" / "devin" / "config.json"
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -78,6 +93,8 @@ def read_json(path, default=None):
 def write_atomic(path: Path, text: str) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     temporary.write_text(text)
+    if path.exists():
+        shutil.copymode(path, temporary)
     os.replace(temporary, path)
 
 
@@ -95,8 +112,14 @@ def clip(text: str, limit: int = BODY_LIMIT) -> str:
 
 @functools.lru_cache(maxsize=1)
 def command() -> str:
+    """How agents invoke this script: `lanemsg` when that name on PATH runs this file (a symlink to it, or a small
+    wrapper script that names it), otherwise this interpreter and this file."""
     on_path = shutil.which("lanemsg")
-    return "lanemsg" if on_path and Path(on_path).resolve() == SELF else f"python3 {shlex.quote(str(SELF))}"
+    if on_path:
+        path = Path(on_path)
+        if path.resolve() == SELF or (path.stat().st_size < 4096 and str(SELF) in path.read_text(errors="ignore")):
+            return "lanemsg"
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(SELF))}"
 
 
 def proc_stat(pid) -> list | None:
@@ -124,14 +147,28 @@ def live_local_session(data: dict) -> bool:
             and (not data.get("procStart") or str(data["procStart"]) == fields[19]))
 
 
-def claude_ancestor() -> dict | None:
-    """The Claude Code session this process runs under, found by walking up the process tree."""
+def codex_process(pid) -> bool:
+    try:
+        return Path(f"/proc/{int(pid)}/comm").read_text().strip() == "codex"
+    except (OSError, ValueError):
+        return False
+
+
+def orchestrator_ancestor() -> dict | None:
+    """The Claude Code or Codex session this process runs under: the nearest one up the process tree. Codex gives
+    every shell command it runs the id of its root session in CODEX_SESSION_ID, also when a subagent thread runs
+    the command."""
     pid, seen = os.getpid(), set()
+    codex_session = os.environ.get("CODEX_SESSION_ID") or os.environ.get("CODEX_THREAD_ID")
     while pid > 1 and pid not in seen:
         seen.add(pid)
         data = read_json(claude_sessions() / f"{pid}.json")
         if isinstance(data, dict) and data.get("sessionId") and data.get("pid") == pid and live_local_session(data):
-            return {"agent": "claude", "claude_session_id": data["sessionId"], "name": data.get("name"), "pid": pid}
+            return {"agent": "claude", "session_id": data["sessionId"], "name": data.get("name"),
+                    "host": socket.gethostname(), "pid": pid}
+        if codex_session and codex_process(pid):
+            return {"agent": "codex", "session_id": codex_session, "thread_id": os.environ.get("CODEX_THREAD_ID"),
+                    "host": socket.gethostname(), "pid": pid}
         fields = proc_stat(pid)
         pid = int(fields[1]) if fields else 0
     return None
@@ -147,7 +184,7 @@ def claude_socket(target: dict) -> str | None:
         sock = data.get("messagingSocketPath")
         if not sock or not os.path.exists(sock) or not live_local_session(data):
             continue
-        if target.get("claude_session_id") and data.get("sessionId") == target["claude_session_id"]:
+        if target.get("session_id") and data.get("sessionId") == target["session_id"]:
             return sock
         if target.get("name") and data.get("name") == target["name"]:
             by_name.append((data.get("updatedAt") or 0, sock))
@@ -167,14 +204,147 @@ def post_to_claude(sock: str, text: str) -> str:
             return ""
 
 
+def read_exactly(stream, size: int) -> bytes:
+    data = stream.read(size)
+    if len(data) < size:
+        raise OSError("the Codex app-server closed the connection")
+    return data
+
+
+def apply_mask(data: bytes, key: bytes) -> bytes:
+    return bytes(byte ^ key[index % 4] for index, byte in enumerate(data))
+
+
+def websocket_send(connection: socket.socket, text: str, masked: bool = True) -> None:
+    """Send one WebSocket text frame (clients mask their frames, servers do not)."""
+    data = text.encode()
+    size = len(data)
+    length = bytes([size]) if size < 126 else bytes([126]) + size.to_bytes(2, "big") if size < 65536 \
+        else bytes([127]) + size.to_bytes(8, "big")
+    key = os.urandom(4) if masked else b""
+    connection.sendall(bytes([0x81, length[0] | (0x80 if masked else 0)]) + length[1:] + key
+                       + (apply_mask(data, key) if masked else data))
+
+
+def websocket_receive(stream) -> str:
+    """Read one WebSocket text message, skipping control frames."""
+    parts = []
+    while True:
+        first, second = read_exactly(stream, 2)
+        size = second & 0x7F
+        if size >= 126:
+            size = int.from_bytes(read_exactly(stream, 2 if size == 126 else 8), "big")
+        key = read_exactly(stream, 4) if second & 0x80 else b""
+        data = read_exactly(stream, size)
+        if first & 0x0F == 8:
+            raise OSError("the Codex app-server closed the connection")
+        if first & 0x0F < 8:
+            parts.append(apply_mask(data, key) if key else data)
+            if first & 0x80:
+                return b"".join(parts).decode()
+
+
+@contextmanager
+def codex_app_server(timeout: float = 10.0):
+    """JSON-RPC to this host's Codex app-server daemon, which speaks WebSocket on its Unix control socket. Yields
+    request(method, params), which returns the result or raises OSError."""
+    path = os.path.realpath(codex_home() / "app-server-control" / "app-server-control.sock")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(timeout)
+        try:
+            connection.connect(path)
+        except OSError as exc:
+            raise OSError(f"no Codex app-server daemon is running on {socket.gethostname()} ({exc})") from exc
+        key = base64.b64encode(os.urandom(16)).decode()
+        connection.sendall(f"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                           f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n".encode())
+        with connection.makefile("rb") as stream:
+            head = [stream.readline()]
+            while head[-1] not in (b"\r\n", b""):
+                head.append(stream.readline())
+            accept = base64.b64encode(hashlib.sha1((key + WEBSOCKET_GUID).encode()).digest())
+            if b" 101 " not in head[0] or accept not in b"".join(head):
+                raise OSError(f"the Codex app-server refused the WebSocket upgrade: {head[0]!r}")
+            ids = itertools.count(1)
+
+            def request(method: str, params: dict) -> dict:
+                request_id = next(ids)
+                websocket_send(connection, json.dumps({"id": request_id, "method": method, "params": params}))
+                while True:
+                    try:
+                        reply = json.loads(websocket_receive(stream))
+                    except ValueError as exc:
+                        raise OSError(f"unreadable reply from the Codex app-server: {exc}") from exc
+                    if reply.get("id") != request_id or "method" in reply:
+                        continue
+                    error = reply.get("error")
+                    if error:
+                        detail = error.get("message", error) if isinstance(error, dict) else error
+                        raise OSError(f"{method} failed: {detail}")
+                    return reply.get("result") or {}
+
+            request("initialize", {"clientInfo": {"name": "lanemsg", "version": "1"},
+                                   "capabilities": {"experimentalApi": True}})
+            websocket_send(connection, json.dumps({"method": "initialized"}))
+            yield request
+
+
+def post_to_codex(target: dict, text: str, message_id: str) -> str:
+    """Steer the message into the Codex session's running turn. When no turn is running, queue it as the session's
+    next turn, which the app-server starts at once."""
+    thread, entry = target["session_id"], [{"type": "text", "text": text}]
+    with codex_app_server() as request:
+        status = ((request("thread/read", {"threadId": thread}).get("thread") or {}).get("status") or {}).get("type")
+        if status == "active":
+            turns = request("thread/turns/list", {"threadId": thread, "limit": 1}).get("data") or [{}]
+            if turns[0].get("status") == "inProgress":
+                try:
+                    request("turn/steer", {"threadId": thread, "expectedTurnId": turns[0].get("id"), "input": entry,
+                                           "clientUserMessageId": message_id})
+                    return f"steered into the running turn of Codex session {thread}"
+                except OSError:
+                    pass
+        elif status != "idle":
+            raise OSError(f"Codex session {thread} is {status or 'unknown'} on {socket.gethostname()}")
+        request("thread/queue/add", {"threadId": thread, "input": entry, "clientUserMessageId": message_id})
+        return f"queued as the next turn of Codex session {thread}"
+
+
+def post_to_orchestrator(target: dict, text: str, message_id: str) -> str:
+    """Deliver one message to the orchestrator's session, which must run on this host."""
+    if target.get("agent") == "codex":
+        return post_to_codex(target, text, message_id)
+    sock = claude_socket(target)
+    if not sock:
+        raise OSError(f"no live Claude session on {socket.gethostname()} is registered as this lane's orchestrator")
+    return post_to_claude(sock, text)
+
+
+def relay_push(mailbox: Mailbox, host: str, min_age_s: float) -> list:
+    """Run the push on the orchestrator's host, the only host from which its session can be reached."""
+    remote = shlex.join([sys.executable, "-I", str(SELF), "push", "--min-age", str(min_age_s),
+                         str(mailbox.path.resolve())])
+    try:
+        result = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, remote],
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+        if result.returncode:
+            raise OSError(result.stderr.strip()[-300:] or f"ssh exited with status {result.returncode}")
+        return json.loads(result.stdout.strip().splitlines()[-1])
+    except (OSError, subprocess.TimeoutExpired, ValueError, IndexError) as exc:
+        raise OSError(f"relay to {host} failed: {exc}") from exc
+
+
 def parse_target(value: str) -> dict:
-    is_uuid = len(value) == 36 and value.count("-") == 4
-    return {"claude_session_id": value} if is_uuid else {"name": value}
+    """An orchestrator named by hand: `[claude:|codex:]<session id or Claude session name>[@<host>]`."""
+    agent, _, rest = value.partition(":") if value.startswith(("claude:", "codex:")) else ("claude", "", value)
+    reference, _, host = rest.partition("@")
+    key = "session_id" if agent == "codex" or (len(reference) == 36 and reference.count("-") == 4) else "name"
+    return {"agent": agent, key: reference, **({"host": host} if host else {})}
 
 
 def describe(sender: dict) -> str:
-    if sender.get("agent") == "claude":
-        return f"orchestrator {sender.get('name') or sender.get('claude_session_id')}"
+    if sender.get("agent") in ("claude", "codex"):
+        return f"orchestrator {sender.get('name') or sender['agent'] + ' session ' + str(sender.get('session_id'))}"
     if sender.get("agent") == "lane":
         return f"lane {sender.get('lane')} (attempt {sender.get('attempt')})"
     if sender.get("agent") == "file":
@@ -308,6 +478,17 @@ class Mailbox:
         if path.exists():
             os.replace(path, path.with_name(f"{attempt}.stale-{int(time.time())}.json.old"))
 
+    def reserve_attempt(self) -> int:
+        """Claim the next unused attempt number; O_EXCL gives concurrent launches different numbers."""
+        names = (re.fullmatch(r"(\d+)\.(json|launch)", path.name) for path in (self.path / "attempts").iterdir())
+        attempt = max((int(match.group(1)) for match in names if match), default=0) + 1
+        while True:
+            try:
+                os.close(os.open(self.path / "attempts" / f"{attempt}.launch", os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+                return attempt
+            except FileExistsError:
+                attempt += 1
+
     def bind(self, attempt, session_id: str) -> bool:
         """Bind the attempt to the first session that reports in; True if this session owns the attempt."""
         if not session_id:
@@ -331,7 +512,7 @@ class Mailbox:
         return read_json(self.path / "orchestrator.json")
 
     def set_orchestrator(self, target: dict, how: str) -> None:
-        target = {key: target.get(key) for key in ("claude_session_id", "name") if target.get(key)}
+        target = {key: target[key] for key in ("agent", "session_id", "name", "host") if target.get(key)}
         current = self.orchestrator() or {}
         if all(current.get(key) == value for key, value in target.items()):
             return
@@ -360,15 +541,20 @@ class Mailbox:
         return [message for _, message in self.list("outbox") if message["kind"] == "ask"]
 
 
-def push_pending(mailbox: Mailbox, min_age_s: float = 0.0) -> int:
-    """Post the lane's undelivered messages to its orchestrator's Claude session; returns how many were posted.
-    The first failed push of a message also leaves a TO_ORCHESTRATOR_*.md copy in the lane directory, where
-    file-based lane watchers look."""
+def push_pending(mailbox: Mailbox, min_age_s: float = 0.0, relay: bool = True) -> list:
+    """Post the lane's undelivered messages to its orchestrator's session; returns the ids it posted. When the
+    orchestrator runs on another host, the push runs there over ssh. The first failed push of a message also
+    leaves a TO_ORCHESTRATOR_*.md copy in the lane directory, where file-based lane watchers look."""
     if not mailbox.has("outbox", "new"):
-        return 0
+        return []
     target = mailbox.orchestrator()
-    sock = claude_socket(target) if target else None
-    pushed = 0
+    host, relay_error = (target or {}).get("host"), None
+    if relay and host and host != socket.gethostname():
+        try:
+            return relay_push(mailbox, host, min_age_s)
+        except OSError as exc:
+            relay_error = exc
+    pushed = []
     with mailbox.locked():
         state = mailbox.state()
         failures = state.setdefault("push_failures", {})
@@ -377,9 +563,9 @@ def push_pending(mailbox: Mailbox, min_age_s: float = 0.0) -> int:
             if time.time() - message.get("created_ts", 0) < min_age_s:
                 continue
             try:
-                if not sock:
-                    raise OSError("no live Claude session is registered as this lane's orchestrator")
-                response = post_to_claude(sock, format_for_orchestrator(message, mailbox))
+                if relay_error or not target:
+                    raise relay_error or OSError("no orchestrator session is registered for this lane")
+                response = post_to_orchestrator(target, format_for_orchestrator(message, mailbox), message["id"])
             except OSError as exc:
                 if message["id"] not in failures:
                     copy = mailbox.path.parent / f"TO_ORCHESTRATOR_{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_" \
@@ -391,8 +577,8 @@ def push_pending(mailbox: Mailbox, min_age_s: float = 0.0) -> int:
                 continue
             mailbox.move(message["id"], "outbox", "cur" if message["kind"] == "ask" else "done", ("new",))
             failures.pop(message["id"], None)
-            mailbox.log("pushed", id=message["id"], socket=sock, response=response[:300])
-            pushed += 1
+            mailbox.log("pushed", id=message["id"], target=target, response=response[:300])
+            pushed.append(message["id"])
         if failures != before:
             write_atomic(mailbox.path / "state.json", json.dumps(state, indent=1) + "\n")
     return pushed
@@ -679,10 +865,10 @@ def lane_sender(mailbox: Mailbox, attempt) -> dict:
 
 
 def orchestrator_sender(mailbox: Mailbox) -> dict:
-    claude = claude_ancestor()
-    if claude:
-        mailbox.set_orchestrator(claude, "orchestrator wrote to the lane")
-        return claude
+    session = orchestrator_ancestor()
+    if session:
+        mailbox.set_orchestrator(session, "orchestrator wrote to the lane")
+        return session
     return {"agent": "other", "host": socket.gethostname(), "pid": os.getppid()}
 
 
@@ -699,14 +885,15 @@ def lane_delivery_hint(mailbox: Mailbox) -> str:
             "parked": "the lane reads it when it is resumed",
             "waiting": "the lane reads it when it starts",
             "done": "WARNING: the lane is finished and will not read it",
-            "failed": "WARNING: the lane has failed and will not read it"}.get(status, f"lane status: {status}")
+            "failed": "WARNING: the lane has failed and will not read it"}.get(
+        status, "it reaches the lane at its next tool call, or when the lane next starts or resumes")
 
 
 def push_report(mailbox: Mailbox, message: dict) -> str:
-    push_pending(mailbox)
-    queue_state = (mailbox.find(message["id"]) or ("", "?", None))[1]
-    if queue_state != "new":
-        return "delivered to the orchestrator's Claude session"
+    """Whether the message reached the orchestrator. The push's own result comes first: after a push relayed to
+    another host, this host's NFS cache can still list the moved message as new."""
+    if message["id"] in push_pending(mailbox) or (mailbox.find(message["id"]) or ("", "?", None))[1] != "new":
+        return "delivered to the orchestrator's session"
     return "queued: no live orchestrator session took it yet; it is retried with your next message and " \
            "delivered when the orchestrator adopts this lane"
 
@@ -848,28 +1035,67 @@ def hooks_config() -> dict:
 
 
 def cmd_install_hooks(args) -> str:
-    path = Path(args.project).resolve() / ".devin" / "hooks.v1.json"
-    existing = read_json(path) if path.exists() else {}
-    if not isinstance(existing, dict):
-        raise LaneError(f"{path} is not a JSON object; fix it by hand first")
-    merged = dict(existing)
+    """Merge the hooks into <project>/.devin/hooks.v1.json, or into the user's Devin config (all projects)."""
+    path = Path(args.project).resolve() / ".devin" / "hooks.v1.json" if args.project else devin_user_config()
+    config = read_json(path) if path.exists() else {}
+    hooks = config if args.project else config.get("hooks", {}) if isinstance(config, dict) else None
+    if not isinstance(config, dict) or not isinstance(hooks, dict):
+        raise LaneError(f"{path} does not hold a JSON object of hooks; fix it by hand first")
+    merged = dict(hooks)
     for event, entries in hooks_config().items():
         merged[event] = [item for item in merged.get(event, []) if "LANEMSG_HOOK" not in json.dumps(item)] + entries
-    path.parent.mkdir(exist_ok=True)
-    write_atomic(path, json.dumps(merged, indent=2) + "\n")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_atomic(path, json.dumps(merged if args.project else {**config, "hooks": merged}, indent=2) + "\n")
     return f"installed lanemsg hooks in {path}"
 
 
 def cmd_adopt(args) -> str:
-    claude = claude_ancestor()
-    if not claude:
-        raise LaneError("adopt must run inside the Claude Code session that will receive the lanes' messages")
+    session = orchestrator_ancestor()
+    if not session:
+        raise LaneError("adopt must run inside the Claude Code or Codex session that will receive the lanes' messages")
     mailboxes = [resolve_lane(reference) for reference in args.lanes]
     for mailbox in mailboxes:
-        mailbox.set_orchestrator(claude, "adopt")
+        mailbox.set_orchestrator(session, "adopt")
         push_pending(mailbox)
-    return f"{claude.get('name') or claude['claude_session_id']} now receives messages from: " + \
-        ", ".join(mailbox.lane["key"] for mailbox in mailboxes)
+    return f"{describe(session)} now receives messages from: " + ", ".join(mailbox.lane["key"] for mailbox in mailboxes)
+
+
+def cmd_register(args) -> str:
+    lane_dir = Path(args.lane_dir).resolve()
+    lane_dir.mkdir(parents=True, exist_ok=True)
+    mailbox = register_lane(lane_dir, args.name or lane_dir.name, Path(args.run_root or lane_dir.parent))
+    session = parse_target(args.session) if args.session else orchestrator_ancestor()
+    if session:
+        mailbox.set_orchestrator(session, "register")
+    key = shlex.quote(mailbox.lane["key"])
+    receiver = describe(session) if session else f"nobody yet; run `{command()} adopt {key}` inside the orchestrator"
+    return f"registered lane {key}; its messages go to {receiver}\n" \
+           f"launch an attempt with: {command()} run {key} -- devin -p --prompt-file <brief>"
+
+
+def cmd_run(args) -> str:
+    """Replace this process with an attempt of the lane, its identity in the environment (never returns)."""
+    argv = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
+    if not argv:
+        raise LaneError(f"usage: {command()} run <lane> -- <command> [arguments]")
+    mailbox, executable = resolve_lane(args.lane), shutil.which(argv[0])
+    if not executable:
+        raise LaneError(f"cannot run {argv[0]}: no such executable")
+    attempt, engine = mailbox.reserve_attempt(), "codex" if Path(argv[0]).name == "codex" else "devin"
+    mailbox.log("launched", attempt=str(attempt), engine=engine, host=socket.gethostname(), argv=argv)
+    env = {**os.environ, "LANEMSG_DIR": str(mailbox.path.resolve()), "LANEMSG_ATTEMPT": str(attempt),
+           "LANEMSG_HOOK": str(SELF), "LANEMSG_PYTHON": sys.executable, "LANEMSG_ENGINE": engine}
+    try:
+        os.execve(executable, argv, env)
+    except OSError as exc:
+        raise LaneError(f"cannot run {argv[0]}: {exc}") from exc
+
+
+def cmd_push(args) -> str:
+    mail = Path(args.mail)
+    if not (mail / "lane.json").exists():
+        raise LaneError(f"{mail} is not a lane mailbox")
+    return json.dumps(push_pending(Mailbox(mail), args.min_age, relay=False))
 
 
 def main(argv=None) -> int:
@@ -896,10 +1122,23 @@ def main(argv=None) -> int:
     sub.add_argument("lane", nargs="?")
     sub = commands.add_parser("lanes", help="list registered lanes")
     sub.add_argument("--all", action="store_true")
-    sub = commands.add_parser("adopt", help="make this Claude session the orchestrator of these lanes")
+    sub = commands.add_parser("register", help="create a lane's mailbox; the calling session becomes its orchestrator")
+    sub.add_argument("lane_dir")
+    sub.add_argument("--name", help="short lane name (default: the directory's name)")
+    sub.add_argument("--run-root", help="directory that holds the run's lanes (default: the lane directory's parent)")
+    sub.add_argument("--session", help="orchestrator session, when register does not run inside it: "
+                                       "[claude:|codex:]<session id or Claude session name>[@<host>]")
+    sub = commands.add_parser("run", help="launch an attempt of a lane: run <lane> -- devin -p --prompt-file <brief>")
+    sub.add_argument("lane")
+    sub.add_argument("argv", nargs=argparse.REMAINDER)
+    sub = commands.add_parser("adopt", help="make this Claude Code or Codex session the orchestrator of these lanes")
     sub.add_argument("lanes", nargs="+")
-    sub = commands.add_parser("install-hooks", help="write the generic Devin hooks into <project>/.devin")
-    sub.add_argument("project")
+    sub = commands.add_parser("install-hooks", help="merge the generic Devin hooks into <project>/.devin/hooks.v1.json"
+                                                    ", or into ~/.config/devin/config.json without a project")
+    sub.add_argument("project", nargs="?")
+    sub = commands.add_parser("push", help="post a lane's undelivered messages from this host (run by the ssh relay)")
+    sub.add_argument("mail")
+    sub.add_argument("--min-age", type=float, default=0.0)
     sub = commands.add_parser("hook", help="Devin hook entry point (reads the event payload on stdin)")
     sub.add_argument("event")
     args = parser.parse_args(argv)
@@ -908,7 +1147,9 @@ def main(argv=None) -> int:
     handlers = {"send": lambda: cmd_send(args, "note"), "ask": lambda: cmd_send(args, "ask"),
                 "reply": lambda: cmd_reply(args), "ack": lambda: cmd_ack(args), "inbox": lambda: cmd_inbox(args),
                 "show": lambda: cmd_show(args), "status": lambda: cmd_status(args), "lanes": lambda: cmd_lanes(args),
-                "adopt": lambda: cmd_adopt(args), "install-hooks": lambda: cmd_install_hooks(args)}
+                "register": lambda: cmd_register(args), "run": lambda: cmd_run(args),
+                "adopt": lambda: cmd_adopt(args), "install-hooks": lambda: cmd_install_hooks(args),
+                "push": lambda: cmd_push(args)}
     try:
         print(handlers[args.command]())
     except LaneError as exc:
