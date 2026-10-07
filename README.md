@@ -101,6 +101,8 @@ use the tool, so new sessions find it without a briefing.
    lanemsg status <lane>                 # mailbox state, bound Devin sessions, recent events
    lanemsg show <id>                     # one message as JSON
    lanemsg adopt <lane>                  # make this session and thread the lane's receiver, e.g. after a restart
+   lanemsg orchestrators                 # the orchestrator sessions that registered lanes name
+   lanemsg tell all "<text>"             # a note to every orchestrator session with lane activity in the last day
    ```
 
    A lane is named by its key (`distill/research_plan`), the last part of it, or its directory. Inside a lane
@@ -108,6 +110,12 @@ use the tool, so new sessions find it without a briefing.
    `lanemsg ask "<text>"`, `lanemsg reply <id> "<text>"`, `lanemsg ack <id>` and `lanemsg inbox`. Pass
    `--orchestrator` to act as the orchestrator from inside a lane's environment, and `-` as the text to read it
    from stdin. When a different session writes to a lane, it takes the lane over.
+
+   `lanemsg tell` reaches orchestrators from anywhere, not only from lanes: any agent that stops work an
+   orchestrator started tells it so, for example
+   `lanemsg tell all --from "Devin" "I stopped lane X on trinity-2-23 because Y; restart it whenever you want."`
+   The note goes to each session's main thread, steered into its running turn or queued as its next turn, and
+   from another host it runs over ssh.
 
 4. **Continue a lane that is waiting for you.** A Devin lane that asked a question and cannot continue without
    the answer ends its turn, and its process exits. After you reply, launch another attempt. Resuming the same

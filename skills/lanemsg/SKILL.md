@@ -47,6 +47,18 @@ lanemsg inbox                     # open lane messages, including any that could
 lanemsg lanes --all               # registered lanes and their queues
 lanemsg status <lane>             # mailbox state, bound Devin sessions, recent events
 lanemsg adopt <lane>              # take a lane over, e.g. after your session restarts
+lanemsg orchestrators             # the orchestrator sessions that registered lanes name
+lanemsg tell all "<text>"         # a note to every orchestrator session active in the last day
+```
+
+## When you stop something another agent started
+
+The user's rule: whenever you stop work that another agent started (a lane, an orchestrator, a service or a
+job), tell the orchestrators right away, including the distillation orchestrator: what you stopped, where, why,
+and that they can restart it whenever they choose.
+
+```bash
+lanemsg tell all --from "<who you are>" "I stopped <what> on <host> because <why>; restart it whenever you want."
 ```
 
 ## A lane waiting for your answer

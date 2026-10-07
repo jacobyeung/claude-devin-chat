@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -626,6 +627,43 @@ def test_lanes_on_other_hosts_relay_the_push_to_the_orchestrators_host(lane, mon
                         lambda argv, **kwargs: subprocess.CompletedProcess(argv, 255, "", "Connection refused"))
     assert "queued" in cli(capsys, "send", "second note")[1]
     assert last_event(mailbox)["error"] == "relay to orchestrator-host failed: Connection refused"
+
+
+def test_tell_reaches_every_recently_active_orchestrator_session(lane, capsys, fake_codex):
+    stale_session = "01a10000-0000-7000-8000-000000000000"
+    codex_orchestrator(lane("alpha"))
+    codex_orchestrator(lane("beta"))
+    old = lane("gamma")
+    old.set_orchestrator({"agent": "codex", "session_id": stale_session, "host": socket.gethostname()}, "test")
+    two_days_ago = time.time() - 2 * 86400
+    os.utime(old.path / "events.jsonl", (two_days_ago, two_days_ago))
+    listing = cli(capsys, "orchestrators")[1]
+    assert f"codex session {CODEX_ID}" in listing and "2 lanes" in listing and stale_session in listing
+    code, out, _ = cli(capsys, "tell", "all", "--from", "Devin", "I stopped lane alpha; restart it whenever you like.")
+    assert code == 0 and f"codex session {CODEX_ID}" in out and stale_session not in out
+    method, params = fake_codex["calls"][-1]
+    assert method == "thread/queue/add" and params["threadId"] == CODEX_ID
+    assert "[lanemsg] NOTE from Devin" in params["input"][0]["text"]
+    assert "restart it whenever you like" in params["input"][0]["text"]
+
+
+def test_tell_runs_on_the_orchestrators_host(lane, monkeypatch, capsys, fake_codex):
+    codex_orchestrator(lane(), host="orchestrator-host")
+    commands = []
+
+    def ssh(argv, input="", **kwargs):
+        commands.append(argv)
+        out = io.StringIO()
+        monkeypatch.setattr(sys, "stdin", io.StringIO(input))
+        with contextlib.redirect_stdout(out):
+            lanemsg.main(shlex.split(argv[-1])[3:])
+        return subprocess.CompletedProcess(argv, 0, out.getvalue(), "")
+    monkeypatch.setattr(lanemsg.subprocess, "run", ssh)
+    out = cli(capsys, "tell", CODEX_ID, "--from", "Devin", "stopped", "your", "lanes")[1]
+    assert commands[0][-2] == "orchestrator-host"
+    assert shlex.split(commands[0][-1])[3:8] == ["tell", "--here", "--from", "Devin", f"codex:{CODEX_ID}@orchestrator-host"]
+    assert f"codex session {CODEX_ID} on orchestrator-host: queued" in out
+    assert "stopped your lanes" in fake_codex["calls"][-1][1]["input"][0]["text"]
 
 
 def test_register_records_the_calling_session_and_run_starts_numbered_attempts(tmp_path, capsys, fake_claude):

@@ -59,6 +59,7 @@ FOREGROUND_SUBAGENT_HOLD_S = 3 * 3600
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 DATA_ROOT = Path("/data2/jjyeung/lanemsg")
 PYTHON = "/data2/jjyeung/envs/miniforge3/bin/python"
+TELL_ACTIVE_S = 24 * 3600
 
 
 class LaneError(Exception):
@@ -356,18 +357,27 @@ def post_to_orchestrator(target: dict, text: str, message_id: str, threads=()) -
     return post_to_claude(sock, text)
 
 
-def relay_push(mailbox: Mailbox, host: str, min_age_s: float) -> list:
-    """Run the push on the orchestrator's host, the only host from which its session can be reached."""
-    remote = shlex.join([sys.executable, "-I", str(SELF), "push", "--min-age", str(min_age_s),
-                         str(mailbox.path.resolve())])
+def run_on(host: str, args: list, stdin_text: str = "") -> str:
+    """Run this script with `args` on another host over ssh and return the last line it prints. An orchestrator's
+    session can be reached only from the host where it runs."""
+    remote = shlex.join([sys.executable, "-I", str(SELF), *args])
     try:
         result = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, remote],
-                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+                                input=stdin_text, capture_output=True, text=True, timeout=60)
         if result.returncode:
             raise OSError(result.stderr.strip()[-300:] or f"ssh exited with status {result.returncode}")
-        return json.loads(result.stdout.strip().splitlines()[-1])
-    except (OSError, subprocess.TimeoutExpired, ValueError, IndexError) as exc:
+        return result.stdout.strip().splitlines()[-1]
+    except (OSError, subprocess.TimeoutExpired, IndexError) as exc:
         raise OSError(f"relay to {host} failed: {exc}") from exc
+
+
+def relay_push(mailbox: Mailbox, host: str, min_age_s: float) -> list:
+    """Run the push on the orchestrator's host."""
+    line = run_on(host, ["push", "--min-age", str(min_age_s), str(mailbox.path.resolve())])
+    try:
+        return json.loads(line)
+    except ValueError as exc:
+        raise OSError(f"relay to {host} failed: unexpected reply {line[:200]!r}") from exc
 
 
 def parse_target(value: str) -> dict:
@@ -1149,6 +1159,56 @@ def cmd_push(args) -> str:
     return json.dumps(push_pending(Mailbox(mail), args.min_age, relay=False))
 
 
+def known_orchestrators(within_s: float = 0) -> list:
+    """The orchestrator sessions that registered lanes name, most recently active first; with within_s, only those
+    with a lane that logged an event in the last within_s seconds."""
+    sessions = {}
+    for lane in registered_lanes():
+        mailbox = Mailbox(Path(lane["mail"]))
+        target = mailbox.orchestrator() or {}
+        try:
+            active = (mailbox.path / "events.jsonl").stat().st_mtime
+        except OSError:
+            continue
+        if target.get("session_id"):
+            entry = sessions.setdefault(target["session_id"], {**target, "lanes": 0, "active": 0.0})
+            entry.update(lanes=entry["lanes"] + 1, active=max(entry["active"], active))
+    found = sorted(sessions.values(), key=lambda entry: -entry["active"])
+    return [entry for entry in found if not within_s or time.time() - entry["active"] < within_s]
+
+
+def cmd_orchestrators(args) -> str:
+    return "\n".join(f"{entry['agent']} session {entry['session_id']} on {entry.get('host') or '?'}: {entry['lanes']} "
+                     f"lanes, last lane activity {datetime.fromtimestamp(entry['active'], timezone.utc):%Y-%m-%d %H:%MZ}"
+                     for entry in known_orchestrators()) or "no registered lane names an orchestrator session"
+
+
+def cmd_tell(args) -> str:
+    """Send a note straight to orchestrator sessions, for example after stopping work that they started."""
+    body = body_from(args.words)
+    caller = orchestrator_ancestor()
+    sender = args.sender or (describe(caller) if caller else f"an agent on {socket.gethostname()}")
+    if args.session == "all":
+        targets = known_orchestrators(TELL_ACTIVE_S)
+    else:
+        targets = [entry for entry in known_orchestrators() if entry["session_id"] == args.session] or \
+            [parse_target(args.session if ":" in args.session else f"codex:{args.session}")]
+    text = f"[lanemsg] NOTE from {sender} | {utc_now()}\n{clip(body)}\n>>> No answer needed."
+    lines = []
+    for target in targets:
+        host = target.get("host")
+        label = f"{target['agent']} session {target['session_id']} on {host or '?'}"
+        try:
+            if host and host != socket.gethostname() and not args.here:
+                lines.append(run_on(host, ["tell", "--here", "--from", sender, f"{target['agent']}:{target['session_id']}"
+                                                                                 f"@{host}", "-"], body))
+            else:
+                lines.append(f"{label}: {post_to_orchestrator(target, text, f'tell-{os.urandom(6).hex()}')}")
+        except OSError as exc:
+            lines.append(f"{label}: not delivered: {exc}")
+    return "\n".join(lines) or "no orchestrator session was active in the last day"
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="lanemsg", description=__doc__.split("\n\n")[0])
     parser.add_argument("--orchestrator", action="store_true",
@@ -1187,6 +1247,13 @@ def main(argv=None) -> int:
     sub = commands.add_parser("install-hooks", help="merge the generic Devin hooks into <project>/.devin/hooks.v1.json"
                                                     ", or into ~/.config/devin/config.json without a project")
     sub.add_argument("project", nargs="?")
+    sub = commands.add_parser("orchestrators", help="list the orchestrator sessions that registered lanes name")
+    sub = commands.add_parser("tell", help="send a note straight to orchestrator sessions: tell <session|all> <text>")
+    sub.add_argument("session", help="'all' (every session with lane activity in the last day), a session id, "
+                                     "or [claude:|codex:]<session id>[@<host>]")
+    sub.add_argument("words", nargs="+")
+    sub.add_argument("--from", dest="sender", help="who is writing (default: the calling session, or this host)")
+    sub.add_argument("--here", action="store_true", help=argparse.SUPPRESS)
     sub = commands.add_parser("push", help="post a lane's undelivered messages from this host (run by the ssh relay)")
     sub.add_argument("mail")
     sub.add_argument("--min-age", type=float, default=0.0)
@@ -1200,6 +1267,7 @@ def main(argv=None) -> int:
                 "show": lambda: cmd_show(args), "status": lambda: cmd_status(args), "lanes": lambda: cmd_lanes(args),
                 "register": lambda: cmd_register(args), "run": lambda: cmd_run(args),
                 "adopt": lambda: cmd_adopt(args), "install-hooks": lambda: cmd_install_hooks(args),
+                "orchestrators": lambda: cmd_orchestrators(args), "tell": lambda: cmd_tell(args),
                 "push": lambda: cmd_push(args)}
     try:
         print(handlers[args.command]())
