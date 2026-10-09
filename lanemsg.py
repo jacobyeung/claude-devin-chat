@@ -19,6 +19,11 @@ turn or queued as its next turn. A lane on another host relays the push over ssh
 with the lane's next message, by `lanemsg adopt`, or by the lane's launcher. Codex lanes have no hooks and run
 `lanemsg inbox` between work steps.
 
+Every push starts a turn over the orchestrator's whole context, so a lane's routine notes wait. A note from an
+attempt whose instructions describe the hold travels with the lane's next question or answer, goes out once it
+has waited LANEMSG_NOTE_HOLD_S seconds (30 minutes by default), or goes out when the lane stops; `send --now`
+skips the hold. All of a lane's due messages go out together in one push.
+
 `lanemsg run` (or any launcher) puts the lane identity (LANEMSG_DIR, LANEMSG_ATTEMPT) in each attempt's
 environment. The hooks bind an attempt to the first Devin session that reports in, so nested Devin processes
 that inherit the environment cannot consume the lane's messages.
@@ -60,6 +65,9 @@ WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 DATA_ROOT = Path("/data2/jjyeung/lanemsg")
 PYTHON = "/data2/jjyeung/envs/miniforge3/bin/python"
 TELL_ACTIVE_S = 24 * 3600
+NOTE_HOLD_S = float(os.environ.get("LANEMSG_NOTE_HOLD_S") or 1800)
+HOOK_PUSH_INTERVAL_S = 300
+IDENTITY_VERSION = 2
 
 
 class LaneError(Exception):
@@ -371,9 +379,10 @@ def run_on(host: str, args: list, stdin_text: str = "") -> str:
         raise OSError(f"relay to {host} failed: {exc}") from exc
 
 
-def relay_push(mailbox: Mailbox, host: str, min_age_s: float) -> list:
+def relay_push(mailbox: Mailbox, host: str, min_age_s: float, flush: bool = False) -> list:
     """Run the push on the orchestrator's host."""
-    line = run_on(host, ["push", "--min-age", str(min_age_s), str(mailbox.path.resolve())])
+    line = run_on(host, ["push", "--min-age", str(min_age_s), *(["--flush"] if flush else []),
+                         str(mailbox.path.resolve())])
     try:
         return json.loads(line)
     except ValueError as exc:
@@ -459,12 +468,14 @@ class Mailbox:
             return result
 
     def write(self, queue: str, kind: str, body: str, sender: dict, reply_to: str | None = None,
-              quote: str | None = None) -> dict:
+              quote: str | None = None, hold: bool = False) -> dict:
         lane = self.lane
         stamp = datetime.now(timezone.utc)
         message = {"id": f"{lane['hash']}-{stamp:%Y%m%dT%H%M%S}-{os.urandom(3).hex()}", "kind": kind,
                    "queue": queue, "lane": lane["key"], "sender": sender, "body": body, "reply_to": reply_to,
                    "quote": quote, "created": stamp.strftime("%Y-%m-%d %H:%M:%SZ"), "created_ts": stamp.timestamp()}
+        if hold:
+            message["hold"] = True
         temporary = self.dir(queue, "tmp") / f"{message['id']}.json"
         with open(temporary, "w") as stream:
             stream.write(json.dumps(message, indent=1) + "\n")
@@ -597,17 +608,27 @@ def recipient_threads(mailbox: Mailbox, message: dict, target: dict) -> list:
     return [thread for thread in dict.fromkeys(threads) if thread and thread != target.get("session_id")]
 
 
-def push_pending(mailbox: Mailbox, min_age_s: float = 0.0, relay: bool = True) -> list:
-    """Post the lane's undelivered messages to its orchestrator's session; returns the ids it posted. When the
-    orchestrator runs on another host, the push runs there over ssh. The first failed push of a message also
-    leaves a TO_ORCHESTRATOR_*.md copy in the lane directory, where file-based lane watchers look."""
+def held(message: dict, now: float) -> bool:
+    """A routine lane note waits until another message goes out or NOTE_HOLD_S has passed."""
+    return bool(message.get("hold")) and now - message.get("created_ts", 0) < NOTE_HOLD_S
+
+
+def push_pending(mailbox: Mailbox, min_age_s: float = 0.0, relay: bool = True, flush: bool = False) -> list:
+    """Post the lane's undelivered messages to its orchestrator's session, together in one post; returns the ids
+    it posted. Held notes stay back unless another message goes out, their hold has expired, or flush is set.
+    When the orchestrator runs on another host, the push runs there over ssh. The first failed push of a message
+    also leaves a TO_ORCHESTRATOR_*.md copy in the lane directory, where file-based lane watchers look."""
     if not mailbox.has("outbox", "new"):
+        return []
+    now = time.time()
+    if not flush and all(held(message, now) for _, message in mailbox.list("outbox", ("new",))
+                         if now - message.get("created_ts", 0) >= min_age_s):
         return []
     target = mailbox.orchestrator()
     host, relay_error = (target or {}).get("host"), None
     if relay and host and host != socket.gethostname():
         try:
-            return relay_push(mailbox, host, min_age_s)
+            return relay_push(mailbox, host, min_age_s, flush)
         except OSError as exc:
             relay_error = exc
     pushed = []
@@ -615,30 +636,71 @@ def push_pending(mailbox: Mailbox, min_age_s: float = 0.0, relay: bool = True) -
         state = mailbox.state()
         failures = state.setdefault("push_failures", {})
         before = dict(failures)
-        for _, message in mailbox.list("outbox", ("new",)):
-            if time.time() - message.get("created_ts", 0) < min_age_s:
-                continue
+        now = time.time()
+        due = [message for _, message in mailbox.list("outbox", ("new",))
+               if now - message.get("created_ts", 0) >= min_age_s]
+        if not flush and all(held(message, now) for message in due):
+            due = []
+        batches = {}
+        for message in due:
+            threads = tuple(recipient_threads(mailbox, message, target)) if target else ()
+            batches.setdefault(threads, []).append(message)
+        for threads, batch in batches.items():
             try:
                 if relay_error or not target:
                     raise relay_error or OSError("no orchestrator session is registered for this lane")
-                response = post_to_orchestrator(target, format_for_orchestrator(message, mailbox), message["id"],
-                                                recipient_threads(mailbox, message, target))
+                response = post_to_orchestrator(target, "\n\n".join(format_for_orchestrator(message, mailbox)
+                                                                    for message in batch), batch[0]["id"], threads)
             except OSError as exc:
-                if message["id"] not in failures:
-                    copy = mailbox.path.parent / f"TO_ORCHESTRATOR_{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_" \
-                                                 f"{message['id']}.md"
-                    write_atomic(copy, format_for_orchestrator(message, mailbox) + "\n")
-                if failures.get(message["id"]) != str(exc):
-                    failures[message["id"]] = str(exc)
-                    mailbox.log("push_failed", id=message["id"], error=str(exc), target=target)
+                for message in batch:
+                    if message["id"] not in failures:
+                        copy = mailbox.path.parent / f"TO_ORCHESTRATOR_" \
+                                                     f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_{message['id']}.md"
+                        write_atomic(copy, format_for_orchestrator(message, mailbox) + "\n")
+                    if failures.get(message["id"]) != str(exc):
+                        failures[message["id"]] = str(exc)
+                        mailbox.log("push_failed", id=message["id"], error=str(exc), target=target)
                 continue
-            mailbox.move(message["id"], "outbox", "cur" if message["kind"] == "ask" else "done", ("new",))
-            failures.pop(message["id"], None)
-            mailbox.log("pushed", id=message["id"], target=target, response=response[:300])
-            pushed.append(message["id"])
+            for message in batch:
+                mailbox.move(message["id"], "outbox", "cur" if message["kind"] == "ask" else "done", ("new",))
+                failures.pop(message["id"], None)
+                mailbox.log("pushed", id=message["id"], target=target, response=response[:300])
+                pushed.append(message["id"])
         if failures != before:
             write_atomic(mailbox.path / "state.json", json.dumps(state, indent=1) + "\n")
     return pushed
+
+
+def notes_due(mailbox: Mailbox) -> bool:
+    """True when the lane's oldest undelivered message has waited NOTE_HOLD_S, checked at most once per
+    HOOK_PUSH_INTERVAL_S. Message ids carry their UTC creation time, so the check reads no message files."""
+    try:
+        with os.scandir(mailbox.dir("outbox", "new")) as entries:
+            stamps = [entry.name.split("-")[1] for entry in entries if entry.name.endswith(".json")]
+    except (FileNotFoundError, IndexError):
+        return False
+    marker = mailbox.path / ".hook_push"
+    try:
+        if not stamps or time.time() - marker.stat().st_mtime < HOOK_PUSH_INTERVAL_S:
+            return False
+    except FileNotFoundError:
+        pass
+    try:
+        oldest = datetime.strptime(min(stamps), "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        oldest = 0.0
+    if time.time() - oldest < NOTE_HOLD_S:
+        return False
+    marker.touch()
+    return True
+
+
+def push_quietly(mailbox: Mailbox, flush: bool = False) -> None:
+    """A push from a hook; its failure must not change what the hook returns to the lane."""
+    try:
+        push_pending(mailbox, flush=flush)
+    except Exception:
+        mailbox.log("push_failed", error=traceback.format_exc()[-300:])
 
 
 def format_for_lane(messages: list, header: str) -> str:
@@ -657,18 +719,18 @@ def format_for_lane(messages: list, header: str) -> str:
 
 
 def format_for_orchestrator(message: dict, mailbox: Mailbox) -> str:
+    """Compact on purpose: the orchestrator rereads every message on each later turn. The lane's name and the
+    message id (whose prefix is the lane's hash) both work as the <lane> of `send` and `ask`."""
     lane, sender = mailbox.lane, message["sender"]
     title = {"ask": "QUESTION", "note": "NOTE", "reply": "ANSWER"}[message["kind"]]
-    where = f"lane {lane['key']} (attempt {sender.get('attempt')}, {sender.get('engine', 'devin')} session " \
-            f"{sender.get('session_id') or 'unknown'})"
-    lines = [f"[lanemsg] {title} from {where} | msg {message['id']}"]
+    session = f", session {sender['session_id']}" if message["kind"] == "ask" and sender.get("session_id") else ""
+    lines = [f"[lanemsg] {title} from lane {lane.get('name') or lane['key']} (attempt {sender.get('attempt')}"
+             f"{session}) | msg {message['id']}"]
     if message.get("reply_to"):
         lines.append(f"(answer to your message {message['reply_to']}: \"{message.get('quote') or ''}\")")
     lines.append(clip(message["body"]))
     if message["kind"] == "ask":
-        lines.append(f">>> The lane is waiting for your answer: {command()} reply {message['id']} \"<answer>\"")
-    else:
-        lines.append(f">>> No answer needed. To write to the lane: {command()} send {lane['key']} \"<text>\"")
+        lines.append(f">>> The lane waits for: {command()} reply {message['id']} \"<answer>\"")
     return "\n".join(lines)
 
 
@@ -678,9 +740,14 @@ def identity_block(mailbox: Mailbox, attempt) -> str:
              "while you work; its messages appear in your context as [lanemsg] blocks. Commands:",
              f"  {cli} reply <id> \"<text>\"   answer a message (questions need an answer)",
              f"  {cli} ack <id>   mark a note handled",
-             f"  {cli} send \"<text>\"   tell the orchestrator something it must know now (a final result, a "
-             "blocker, a decision it has to make); keep routine progress out of messages",
-             f"  {cli} ask \"<text>\"   ask the orchestrator; the answer arrives here later"]
+             f"  {cli} send \"<text>\"   tell the orchestrator something it must know (a final result, a "
+             f"blocker, a decision it has to make); a note waits up to {NOTE_HOLD_S / 60:.0f} minutes to travel "
+             "with your next message, so add --now when the orchestrator must act soon; keep routine progress "
+             "out of messages",
+             f"  {cli} ask \"<text>\"   ask the orchestrator; the answer arrives here later",
+             "Each message starts a turn over the orchestrator's whole context, so keep it short: say what happened "
+             "and what the orchestrator must do, and leave hashes, test inventories and evidence lists in your "
+             "files."]
     if os.environ.get("LANEMSG_ENGINE", "devin") == "devin":
         lines.append("If you cannot continue without an answer, record your progress and end your turn: whoever "
                      "launched the lane resumes this same session when the answer arrives. Do not poll for answers.")
@@ -753,6 +820,8 @@ def run_hook(event: str, payload: dict) -> dict | None:
     session_id = payload.get("session_id") or ""
     subagent_call = payload.get("tool_name") in SUBAGENT_TOOLS
     import_file_notes(mailbox)
+    if event in ("PostToolUse", "UserPromptSubmit") and notes_due(mailbox):
+        push_quietly(mailbox)
     if event == "PostToolUse" and not subagent_call and not mailbox.has("inbox", "new") \
             and not mailbox.state().get("reinject", {}).get(session_id):
         return None
@@ -768,9 +837,13 @@ def run_hook(event: str, payload: dict) -> dict | None:
         mailbox.update_state(lambda state: state.setdefault("reinject", {}).__setitem__(session_id, True))
         return None
     if event == "Stop":
+        push_quietly(mailbox, flush=True)
         return stop_decision(mailbox, attempt, session_id)
     if event == "SessionStart":
-        mailbox.update_state(lambda state: state.get("subagents", {}).pop(session_id, None))
+        def start(state):
+            state.get("subagents", {}).pop(session_id, None)
+            state.setdefault("identity", {})[str(attempt)] = IDENTITY_VERSION
+        mailbox.update_state(start)
         parts = [identity_block(mailbox, attempt), open_items_block(mailbox, session_id)]
     elif event in ("UserPromptSubmit", "PostToolUse"):
         reinject = mailbox.update_state(lambda state: state.get("reinject", {}).pop(session_id, None))
@@ -952,6 +1025,9 @@ def push_report(mailbox: Mailbox, message: dict) -> str:
     another host, this host's NFS cache can still list the moved message as new."""
     if message["id"] in push_pending(mailbox) or (mailbox.find(message["id"]) or ("", "?", None))[1] != "new":
         return "delivered to the orchestrator's session"
+    if held(message, time.time()):
+        return f"held: it goes out with your next message or within {NOTE_HOLD_S / 60:.0f} minutes " \
+               f"(`{command()} send --now` delivers at once)"
     return "queued: no live orchestrator session took it yet; it is retried with your next message and " \
            "delivered when the orchestrator adopts this lane"
 
@@ -960,7 +1036,9 @@ def cmd_send(args, kind: str) -> str:
     context = lane_context() if not args.orchestrator else None
     if context:
         mailbox, attempt = context
-        message = mailbox.write("outbox", kind, body_from(args.words), lane_sender(mailbox, attempt))
+        hold = kind == "note" and not getattr(args, "now", False) and NOTE_HOLD_S > 0 and \
+            mailbox.state().get("identity", {}).get(str(attempt)) == IDENTITY_VERSION
+        message = mailbox.write("outbox", kind, body_from(args.words), lane_sender(mailbox, attempt), hold=hold)
         return f"sent {kind} {message['id']}; {push_report(mailbox, message)}"
     if len(args.words) < 2:
         raise LaneError(f"usage: {command()} {kind} <lane> <text>")
@@ -1028,7 +1106,8 @@ def cmd_inbox(args) -> str:
             continue
         states = ("new", "cur", "done") if args.all else ("new", "cur")
         for state, message in mailbox.list("outbox", states):
-            out.append(f"[{state}] " + format_for_orchestrator(message, mailbox))
+            label = "held" if state == "new" and message.get("hold") else state
+            out.append(f"[{label}] " + format_for_orchestrator(message, mailbox))
             if state == "new" and not args.peek:
                 mailbox.move(message["id"], "outbox", "cur" if message["kind"] == "ask" else "done", ("new",))
                 mailbox.log("read", id=message["id"], how="inbox command")
@@ -1114,7 +1193,7 @@ def cmd_adopt(args) -> str:
     mailboxes = [resolve_lane(reference) for reference in args.lanes]
     for mailbox in mailboxes:
         mailbox.set_orchestrator(session, "adopt")
-        push_pending(mailbox)
+        push_pending(mailbox, flush=True)
     return f"{describe(session)} now receives messages from: " + ", ".join(mailbox.lane["key"] for mailbox in mailboxes)
 
 
@@ -1156,7 +1235,7 @@ def cmd_push(args) -> str:
     mail = Path(args.mail)
     if not (mail / "lane.json").exists():
         raise LaneError(f"{mail} is not a lane mailbox")
-    return json.dumps(push_pending(Mailbox(mail), args.min_age, relay=False))
+    return json.dumps(push_pending(Mailbox(mail), args.min_age, relay=False, flush=args.flush))
 
 
 def known_orchestrators(within_s: float = 0) -> list:
@@ -1193,7 +1272,7 @@ def cmd_tell(args) -> str:
     else:
         targets = [entry for entry in known_orchestrators() if entry["session_id"] == args.session] or \
             [parse_target(args.session if ":" in args.session else f"codex:{args.session}")]
-    text = f"[lanemsg] NOTE from {sender} | {utc_now()}\n{clip(body)}\n>>> No answer needed."
+    text = f"[lanemsg] NOTE from {sender} | {utc_now()}\n{clip(body)}"
     lines = []
     for target in targets:
         host = target.get("host")
@@ -1217,6 +1296,8 @@ def main(argv=None) -> int:
     for name in ("send", "ask"):
         sub = commands.add_parser(name, help=f"{name} a message (orchestrator: {name} <lane> <text>)")
         sub.add_argument("words", nargs="+")
+        if name == "send":
+            sub.add_argument("--now", action="store_true", help="lanes: deliver the note at once instead of holding it")
     sub = commands.add_parser("reply", help="answer a message")
     sub.add_argument("id")
     sub.add_argument("words", nargs="+")
@@ -1257,6 +1338,7 @@ def main(argv=None) -> int:
     sub = commands.add_parser("push", help="post a lane's undelivered messages from this host (run by the ssh relay)")
     sub.add_argument("mail")
     sub.add_argument("--min-age", type=float, default=0.0)
+    sub.add_argument("--flush", action="store_true", help="also post held notes")
     sub = commands.add_parser("hook", help="Devin hook entry point (reads the event payload on stdin)")
     sub.add_argument("event")
     args = parser.parse_args(argv)

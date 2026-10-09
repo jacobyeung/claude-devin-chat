@@ -287,7 +287,7 @@ def test_question_round_trip_through_the_orchestrators_claude_session(lane, monk
     pushed = fake_claude[-1]["message"]["content"]
     question_id = names(mailbox, "outbox", "cur")[0]
     assert fake_claude[-1]["type"] == "user" and "may I use 8 GPUs?" in pushed
-    assert f"reply {question_id}" in pushed and "QUESTION from lane r1/ctrl/alpha" in pushed
+    assert f"reply {question_id}" in pushed and "QUESTION from lane alpha (attempt 1, session sess-A)" in pushed
     as_orchestrator(monkeypatch)
     code, out, _ = cli(capsys, "reply", question_id, "yes,", "until", "06:30")
     assert code == 0
@@ -308,7 +308,7 @@ def test_unpushed_messages_wait_and_are_posted_once_an_orchestrator_exists(lane,
     events = [json.loads(line)["event"] for line in (mailbox.path / "events.jsonl").read_text().splitlines()]
     assert events.count("push_failed") == 1
     copy, = mailbox.path.parent.glob("TO_ORCHESTRATOR_*.md")
-    assert "finished step 1" in copy.read_text() and "NOTE from lane r1/ctrl/alpha" in copy.read_text()
+    assert "finished step 1" in copy.read_text() and "NOTE from lane alpha (attempt 1)" in copy.read_text()
     as_orchestrator(monkeypatch)
     assert "fake-orch now receives messages" in cli(capsys, "adopt", "alpha")[1]
     assert names(mailbox, "outbox", "new") == []
@@ -527,7 +527,7 @@ def test_lane_messages_queue_as_the_next_turn_of_an_idle_codex_session(lane, mon
     assert [method for method, _ in fake_codex["calls"]] == ["initialize", "thread/read", "thread/queue/add"]
     params = fake_codex["calls"][-1][1]
     assert params["threadId"] == CODEX_ID and params["clientUserMessageId"] == note_id
-    assert "finished step 1" in params["input"][0]["text"] and "NOTE from lane r1/ctrl/alpha" in params["input"][0]["text"]
+    assert "finished step 1" in params["input"][0]["text"] and "NOTE from lane alpha (attempt 1)" in params["input"][0]["text"]
 
 
 def test_lane_questions_steer_into_the_running_turn_of_a_codex_session(lane, monkeypatch, capsys, fake_codex):
@@ -727,6 +727,67 @@ def test_instructions_name_lanemsg_when_the_command_on_path_is_this_file(tmp_pat
     lanemsg.command.cache_clear()
     assert lanemsg.command() == "lanemsg"
     lanemsg.command.cache_clear()
+
+
+def test_routine_notes_wait_and_travel_with_the_lanes_next_question(lane, monkeypatch, capsys, fake_claude):
+    mailbox = lane()
+    as_lane(monkeypatch, mailbox)
+    assert "--now" in context(hook("SessionStart", source="startup"))
+    mailbox.set_orchestrator({"agent": "claude", "session_id": ORCHESTRATOR_ID}, "test")
+    code, out, _ = cli(capsys, "send", "step 1 done")
+    assert code == 0 and "held" in out and fake_claude == []
+    assert hook("PostToolUse", tool_name="exec") is None and fake_claude == []
+    assert cli(capsys, "ask", "may I start step 2?")[0] == 0
+    assert len(fake_claude) == 1
+    pushed = fake_claude[0]["message"]["content"]
+    assert pushed.index("step 1 done") < pushed.index("may I start step 2?")
+    assert "[lanemsg] NOTE from lane alpha (attempt 1) | msg" in pushed and "No answer needed" not in pushed
+    assert "[lanemsg] QUESTION from lane alpha (attempt 1, session sess-A) | msg" in pushed
+    assert len(names(mailbox, "outbox", "done")) == 1 and len(names(mailbox, "outbox", "cur")) == 1
+
+
+def test_held_notes_go_out_when_the_hold_expires_or_the_lane_stops(lane, monkeypatch, capsys, fake_claude):
+    mailbox = lane()
+    as_lane(monkeypatch, mailbox)
+    hook("SessionStart", source="startup")
+    mailbox.set_orchestrator({"agent": "claude", "session_id": ORCHESTRATOR_ID}, "test")
+    cli(capsys, "send", "first finding")
+    cli(capsys, "send", "second finding")
+    assert fake_claude == []
+    monkeypatch.setattr(lanemsg, "NOTE_HOLD_S", 0.0)
+    assert hook("PostToolUse", tool_name="exec") is None
+    assert len(fake_claude) == 1
+    assert "first finding" in fake_claude[0]["message"]["content"]
+    assert "second finding" in fake_claude[0]["message"]["content"]
+    monkeypatch.setattr(lanemsg, "NOTE_HOLD_S", 1800.0)
+    cli(capsys, "send", "final result")
+    assert len(fake_claude) == 1
+    assert hook("Stop", stop_hook_active=False) is None
+    assert len(fake_claude) == 2 and "final result" in fake_claude[1]["message"]["content"]
+    assert names(mailbox, "outbox", "new") == []
+
+
+def test_now_notes_and_attempts_without_the_hold_instructions_go_out_at_once(lane, monkeypatch, capsys,
+                                                                             fake_claude):
+    mailbox = lane()
+    mailbox.set_orchestrator({"agent": "claude", "session_id": ORCHESTRATOR_ID}, "test")
+    as_lane(monkeypatch, mailbox, attempt=1)
+    assert "delivered" in cli(capsys, "send", "attempt 1 never saw the hold")[1]
+    as_lane(monkeypatch, mailbox, attempt=2)
+    hook("SessionStart", session="sess-B", source="startup")
+    assert "delivered" in cli(capsys, "send", "--now", "the job is stuck")[1]
+    assert len(fake_claude) == 2 and "the job is stuck" in fake_claude[1]["message"]["content"]
+
+
+def test_orchestrator_inbox_shows_and_takes_held_notes(lane, monkeypatch, capsys):
+    mailbox = lane()
+    as_lane(monkeypatch, mailbox)
+    hook("SessionStart", source="startup")
+    assert "held" in cli(capsys, "send", "fyi")[1]
+    as_orchestrator(monkeypatch)
+    out = cli(capsys, "inbox")[1]
+    assert out.startswith("[held] [lanemsg] NOTE from lane alpha (attempt 1)") and "fyi" in out
+    assert names(mailbox, "outbox", "new") == [] and len(names(mailbox, "outbox", "done")) == 1
 
 
 def test_websocket_frames_round_trip_at_every_length_encoding():

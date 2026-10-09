@@ -34,6 +34,13 @@ live under `/data2/jjyeung/lanemsg`.
   because the orchestrator's session has ended, the message stays queued and a `TO_ORCHESTRATOR_*.md` copy is
   written to the lane directory; it is retried with the lane's next message, and `lanemsg adopt` or
   `lanemsg inbox` picks it up.
+- **Held notes.** Every push starts a turn over the orchestrator's whole context, and Claude Code adds its own
+  peer-message preamble to each one, so a lane's routine notes wait and travel together. A note from an attempt
+  whose instructions describe the hold (any attempt whose `SessionStart` hook ran this version) travels with the
+  lane's next question or answer, goes out once it has waited `LANEMSG_NOTE_HOLD_S` (the `PostToolUse` hook
+  pushes due notes at most every five minutes), or goes out when the lane stops. `lanemsg send --now` skips the hold,
+  `lanemsg adopt` flushes held notes, and `lanemsg inbox` shows them as `[held]`. All of a lane's due messages
+  go out in one push. Questions and answers never wait.
 - **Safety.** The hooks do nothing in a process whose environment does not name a lane, so they are safe to
   install for every project. Each attempt binds to the first Devin session that reports in, so nested Devin
   processes that inherit the environment cannot take the lane's messages, and delivery is held while a
@@ -105,8 +112,9 @@ use the tool, so new sessions find it without a briefing.
    lanemsg tell all "<text>"             # a note to every orchestrator session with lane activity in the last day
    ```
 
-   A lane is named by its key (`distill/research_plan`), the last part of it, or its directory. Inside a lane
-   (where `LANEMSG_DIR` is set) the same commands act for the lane: `lanemsg send "<text>"`,
+   A lane is named by its key (`distill/research_plan`), the last part of it, its directory, or its hash (the
+   prefix of each of its message ids). Messages for the orchestrator name the lane by its short name. Inside a lane
+   (where `LANEMSG_DIR` is set) the same commands act for the lane: `lanemsg send [--now] "<text>"`,
    `lanemsg ask "<text>"`, `lanemsg reply <id> "<text>"`, `lanemsg ack <id>` and `lanemsg inbox`. Pass
    `--orchestrator` to act as the orchestrator from inside a lane's environment, and `-` as the text to read it
    from stdin. When a different session writes to a lane, it takes the lane over.
@@ -178,6 +186,7 @@ lets tools that watch files take part.
 | `LANEMSG_RUNS_ROOT` | `/data2/jjyeung/lanemsg/lanes` | Where relative lane names go; lane keys are lane directories relative to it, or absolute paths for lanes outside it |
 | `LANEMSG_CLAUDE_SESSIONS` | `~/.claude/sessions` | Where Claude Code writes its session files |
 | `CODEX_HOME` | `~/.codex` | Where Codex keeps the app-server daemon's control socket |
+| `LANEMSG_NOTE_HOLD_S` | `1800` | How long a lane's routine note may wait for the lane's next message; `0` sends every note at once |
 | `LANEMSG_DIR`, `LANEMSG_ATTEMPT`, `LANEMSG_HOOK`, `LANEMSG_PYTHON`, `LANEMSG_ENGINE` | unset | Lane identity, set by `lanemsg run` or another launcher; the hooks fall back to `/data2/jjyeung/envs/miniforge3/bin/python` |
 
 ## Tests

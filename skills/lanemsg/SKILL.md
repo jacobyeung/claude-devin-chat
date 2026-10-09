@@ -35,7 +35,13 @@ The thread that registered or launched the lane receives its questions and notes
 running turn: a subagent that launched a lane talks with it directly. An answer goes first to the thread that
 asked the question. When the intended thread runs no turn, the main session receives the message, with a note
 naming that thread. A lane on another node reaches you over ssh. Lane messages arrive as user messages that
-start with `[lanemsg] QUESTION|NOTE|ANSWER from lane ...`.
+start with `[lanemsg] QUESTION|NOTE|ANSWER from lane <name> (attempt <n>)`; the lane's name, its key, or the
+8-character prefix of any of its message ids works as `<lane>` below.
+
+Each arriving message starts a turn over your whole context, so a lane's routine notes wait: they travel with
+the lane's next question or answer, arrive after about 30 minutes, or arrive when the lane stops. Lanes use
+`send --now` when you must act soon, and `lanemsg inbox` shows held notes at any time. Brief lanes to message
+only for questions, blockers and final results; leave routine state to your watchdog.
 
 ## Commands
 
