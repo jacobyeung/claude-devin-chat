@@ -22,7 +22,9 @@ with the lane's next message, by `lanemsg adopt`, or by the lane's launcher. Cod
 Every push starts a turn over the orchestrator's whole context, so a lane's routine notes wait. A note from an
 attempt whose instructions describe the hold travels with the lane's next question or answer, goes out once it
 has waited LANEMSG_NOTE_HOLD_S seconds (30 minutes by default), or goes out when the lane stops; `send --now`
-skips the hold. All of a lane's due messages go out together in one push.
+skips the hold. All of a lane's due messages go out together in one push. A lane that cannot continue without
+an answer runs `ask --wait`, which blocks in its running session, keeps its heartbeat file fresh, and returns
+once `reply` records the answer in mail/answered/<question id>.
 
 `lanemsg run` (or any launcher) puts the lane identity (LANEMSG_DIR, LANEMSG_ATTEMPT) in each attempt's
 environment. The hooks bind an attempt to the first Devin session that reports in, so nested Devin processes
@@ -35,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import fcntl
 import functools
 import hashlib
@@ -44,6 +47,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -68,6 +72,11 @@ TELL_ACTIVE_S = 24 * 3600
 NOTE_HOLD_S = float(os.environ.get("LANEMSG_NOTE_HOLD_S") or 1800)
 HOOK_PUSH_INTERVAL_S = 300
 IDENTITY_VERSION = 2
+WAIT_S = float(os.environ.get("LANEMSG_WAIT_S") or 1800)
+WAIT_POLL_S = 3.0
+WAIT_HEARTBEAT_S = 240
+WAITER_FRESH_S = 120
+TRANSIENT_ERRNOS = (errno.EBUSY, errno.ESTALE, errno.EAGAIN, errno.EINTR)
 
 
 class LaneError(Exception):
@@ -105,12 +114,30 @@ def read_json(path, default=None):
         return default
 
 
+def read_text(path) -> str | None:
+    try:
+        return Path(path).read_text().strip() or None
+    except OSError:
+        return None
+
+
+def retrying(action):
+    """Run a filesystem call, retrying for about three seconds the transient errors NFS raises under load."""
+    for attempt in range(6):
+        try:
+            return action()
+        except OSError as exc:
+            if exc.errno not in TRANSIENT_ERRNOS or attempt == 5:
+                raise
+            time.sleep(0.1 * 2 ** attempt)
+
+
 def write_atomic(path: Path, text: str) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     temporary.write_text(text)
     if path.exists():
         shutil.copymode(path, temporary)
-    os.replace(temporary, path)
+    retrying(lambda: os.replace(temporary, path))
 
 
 def lane_key(lane_dir: Path) -> str:
@@ -123,6 +150,10 @@ def lane_key(lane_dir: Path) -> str:
 
 def clip(text: str, limit: int = BODY_LIMIT) -> str:
     return text if len(text) <= limit else text[:limit] + f"\n[... {len(text) - limit} more characters]"
+
+
+def span(seconds: float) -> str:
+    return f"{seconds / 60:.0f} minutes" if seconds >= 90 else f"{seconds:.0f} seconds"
 
 
 @functools.lru_cache(maxsize=1)
@@ -468,20 +499,19 @@ class Mailbox:
             return result
 
     def write(self, queue: str, kind: str, body: str, sender: dict, reply_to: str | None = None,
-              quote: str | None = None, hold: bool = False) -> dict:
+              quote: str | None = None, hold: bool = False, wait: bool = False) -> dict:
         lane = self.lane
         stamp = datetime.now(timezone.utc)
         message = {"id": f"{lane['hash']}-{stamp:%Y%m%dT%H%M%S}-{os.urandom(3).hex()}", "kind": kind,
                    "queue": queue, "lane": lane["key"], "sender": sender, "body": body, "reply_to": reply_to,
                    "quote": quote, "created": stamp.strftime("%Y-%m-%d %H:%M:%SZ"), "created_ts": stamp.timestamp()}
-        if hold:
-            message["hold"] = True
+        message.update({flag: True for flag, value in (("hold", hold), ("wait", wait)) if value})
         temporary = self.dir(queue, "tmp") / f"{message['id']}.json"
         with open(temporary, "w") as stream:
             stream.write(json.dumps(message, indent=1) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
-        os.rename(temporary, self.dir(queue, "new") / temporary.name)
+        retrying(lambda: os.rename(temporary, self.dir(queue, "new") / temporary.name))
         self.log("sent", id=message["id"], queue=queue, kind=kind, reply_to=reply_to, sender=sender)
         return message
 
@@ -520,7 +550,8 @@ class Mailbox:
             if state == to_state:
                 continue
             try:
-                os.rename(self.dir(queue, state) / f"{message_id}.json", self.dir(queue, to_state) / f"{message_id}.json")
+                retrying(lambda: os.rename(self.dir(queue, state) / f"{message_id}.json",
+                                           self.dir(queue, to_state) / f"{message_id}.json"))
                 return True
             except FileNotFoundError:
                 continue
@@ -696,11 +727,82 @@ def notes_due(mailbox: Mailbox) -> bool:
 
 
 def push_quietly(mailbox: Mailbox, flush: bool = False) -> None:
-    """A push from a hook; its failure must not change what the hook returns to the lane."""
+    """A push from a hook. Devin stops a hook after 30 seconds, so a push that must relay over ssh runs in a
+    detached process; a failure never changes what the hook returns to the lane."""
     try:
+        host = (mailbox.orchestrator() or {}).get("host")
+        if host and host != socket.gethostname():
+            subprocess.Popen([sys.executable, "-I", str(SELF), "push", "--relay", *(["--flush"] if flush else []),
+                              str(mailbox.path.resolve())], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+            return
         push_pending(mailbox, flush=flush)
     except Exception:
         mailbox.log("push_failed", error=traceback.format_exc()[-300:])
+
+
+def heartbeat_file(mailbox: Mailbox, explicit: str | None) -> Path | None:
+    """The file a waiting lane keeps fresh: the one named on the command line, else the lane's
+    out/HEARTBEAT.log when it exists (the file lane watchdogs read)."""
+    if explicit:
+        return Path(explicit)
+    default = Path(mailbox.lane.get("lane_dir") or mailbox.path.parent) / "out" / "HEARTBEAT.log"
+    return default if default.exists() else None
+
+
+def claim_answer(mailbox: Mailbox, attempt, question_id: str, reply_id: str) -> str | None:
+    """The answer's text, claimed for this session so the hooks do not deliver it a second time."""
+    found = mailbox.find(reply_id)
+    if not found:
+        return None
+    _, state, message = found
+    note = " (your context may already show it)"
+    if state == "new" and mailbox.move(reply_id, "inbox", "done", ("new",)):
+        session = mailbox.session_for(attempt)
+        mailbox.update_state(lambda current: current.setdefault("delivered", {}).__setitem__(
+            reply_id, {"session": session, "attempt": str(attempt), "at": utc_now(), "how": "ask --wait"}))
+        mailbox.log("delivered", id=reply_id, kind="reply", session=session, attempt=str(attempt), how="ask --wait")
+        note = ""
+    return f"ANSWER from {describe(message['sender'])} to your question {question_id}{note}:\n{clip(message['body'])}"
+
+
+def wait_for_answer(mailbox: Mailbox, attempt, question_id: str, timeout_s: float, heartbeat: Path | None) -> str:
+    """Block until the orchestrator answers, then return the answer. While waiting, keep the waiter marker fresh
+    (it tells `reply` that the lane needs no relaunch) and append to the lane's heartbeat file."""
+    waiting, answered = mailbox.path / "waiting" / question_id, mailbox.path / "answered" / question_id
+    waiting.parent.mkdir(exist_ok=True)
+    try:
+        previous, restore = signal.signal(signal.SIGTERM, lambda *_: sys.exit(143)), True
+    except ValueError:
+        previous, restore = None, False
+    start, marked, beat = time.time(), 0.0, 0.0
+    try:
+        while True:
+            now = time.time()
+            if now - marked >= WAITER_FRESH_S / 4:
+                waiting.touch()
+                marked = now
+            if heartbeat and now - beat >= WAIT_HEARTBEAT_S:
+                with open(heartbeat, "a") as stream:
+                    stream.write(f"{utc_now()} | waiting for the orchestrator's answer to {question_id}\n")
+                beat = now
+            reply_id = read_text(answered)
+            answer = claim_answer(mailbox, attempt, question_id, reply_id) if reply_id else None
+            if answer:
+                return answer
+            if now - start >= timeout_s:
+                raise LaneError(f"no answer after {span(timeout_s)}; question {question_id} stays open. "
+                                f"{answered} appears when the orchestrator answers, and the answer also reaches your "
+                                "next session. Continue with other work, or record your progress and end your turn "
+                                "as your brief directs.")
+            time.sleep(WAIT_POLL_S)
+    finally:
+        if restore:
+            signal.signal(signal.SIGTERM, previous)
+        try:
+            os.utime(waiting, (0, 0))
+        except OSError:
+            pass
 
 
 def format_for_lane(messages: list, header: str) -> str:
@@ -730,7 +832,8 @@ def format_for_orchestrator(message: dict, mailbox: Mailbox) -> str:
         lines.append(f"(answer to your message {message['reply_to']}: \"{message.get('quote') or ''}\")")
     lines.append(clip(message["body"]))
     if message["kind"] == "ask":
-        lines.append(f">>> The lane waits for: {command()} reply {message['id']} \"<answer>\"")
+        where = "in its running session (no relaunch needed)" if message.get("wait") else "for"
+        lines.append(f">>> The lane waits {where}: {command()} reply {message['id']} \"<answer>\"")
     return "\n".join(lines)
 
 
@@ -741,17 +844,21 @@ def identity_block(mailbox: Mailbox, attempt) -> str:
              f"  {cli} reply <id> \"<text>\"   answer a message (questions need an answer)",
              f"  {cli} ack <id>   mark a note handled",
              f"  {cli} send \"<text>\"   tell the orchestrator something it must know (a final result, a "
-             f"blocker, a decision it has to make); a note waits up to {NOTE_HOLD_S / 60:.0f} minutes to travel "
+             f"blocker, a decision it has to make); a note waits up to {span(NOTE_HOLD_S)} to travel "
              "with your next message, so add --now when the orchestrator must act soon; keep routine progress "
              "out of messages",
              f"  {cli} ask \"<text>\"   ask the orchestrator; the answer arrives here later",
+             f"  {cli} ask --wait \"<text>\"   ask and block until the answer arrives (up to {span(WAIT_S)}); "
+             "use it whenever you cannot continue without the answer",
+             f"Run `{cli} ask --wait` as one foreground command with your shell tool's longest timeout; if the tool "
+             "moves it to the background, keep reading its output until it finishes. It keeps your heartbeat fresh "
+             "and prints the answer, so you keep this session and its context. Do not poll for answers yourself.",
+             "Ask only what your brief and the rules files it names leave open. Put related questions in one "
+             "message and state the default you would choose, so a short answer settles it.",
              "Each message starts a turn over the orchestrator's whole context, so keep it short: say what happened "
              "and what the orchestrator must do, and leave hashes, test inventories and evidence lists in your "
              "files."]
-    if os.environ.get("LANEMSG_ENGINE", "devin") == "devin":
-        lines.append("If you cannot continue without an answer, record your progress and end your turn: whoever "
-                     "launched the lane resumes this same session when the answer arrives. Do not poll for answers.")
-    else:
+    if os.environ.get("LANEMSG_ENGINE", "devin") != "devin":
         lines.append(f"Check for messages between work steps with `{cli} inbox`. Do not poll in a loop.")
     return "\n".join(lines)
 
@@ -994,13 +1101,36 @@ def lane_sender(mailbox: Mailbox, attempt) -> dict:
             "engine": os.environ.get("LANEMSG_ENGINE", "devin"), "session_id": mailbox.session_for(attempt)}
 
 
-def orchestrator_sender(mailbox: Mailbox) -> dict:
-    """The writing session. A different session that writes to the lane takes it over; within one session the
-    lane keeps the thread that launched it."""
-    session = orchestrator_ancestor()
-    if session and (mailbox.orchestrator() or {}).get("session_id") != session["session_id"]:
-        mailbox.set_orchestrator(session, "orchestrator wrote to the lane")
-    return session or {"agent": "other", "host": socket.gethostname(), "pid": os.getppid()}
+def receiver_gone(target: dict) -> bool:
+    """True only when this host can tell that the session receiving the lane's messages has ended."""
+    if not target.get("session_id"):
+        return True
+    if target.get("host") and target["host"] != socket.gethostname():
+        return False
+    if target.get("agent") == "codex":
+        try:
+            with codex_app_server(timeout=5) as request:
+                status = (read_thread(request, target["session_id"]).get("status") or {}).get("type")
+        except OSError:
+            return True
+        return status not in ("active", "idle")
+    return claude_socket({"session_id": target["session_id"]}) is None
+
+
+def orchestrator_sender(mailbox: Mailbox) -> tuple:
+    """The writing session, and a note for it when another session receives the lane's messages. A writer takes
+    the lane over only when the lane has no receiver or this host can tell that the receiver has ended, so one
+    orchestrator writing to another's lane cannot redirect that lane's questions; `adopt` takes a lane over
+    explicitly. Within one session the lane keeps the thread that launched it."""
+    session, note = orchestrator_ancestor(), ""
+    current = mailbox.orchestrator() or {}
+    if session and current.get("session_id") != session["session_id"]:
+        if receiver_gone(current):
+            mailbox.set_orchestrator(session, "orchestrator wrote to the lane")
+        else:
+            note = f"; the lane still reports to {describe(current)}, so its messages and answers go there " \
+                   f"(`{command()} adopt {mailbox.lane.get('name') or mailbox.lane['key']}` takes it over)"
+    return session or {"agent": "other", "host": socket.gethostname(), "pid": os.getppid()}, note
 
 
 def body_from(words: list) -> str:
@@ -1026,7 +1156,7 @@ def push_report(mailbox: Mailbox, message: dict) -> str:
     if message["id"] in push_pending(mailbox) or (mailbox.find(message["id"]) or ("", "?", None))[1] != "new":
         return "delivered to the orchestrator's session"
     if held(message, time.time()):
-        return f"held: it goes out with your next message or within {NOTE_HOLD_S / 60:.0f} minutes " \
+        return f"held: it goes out with your next message or within {span(NOTE_HOLD_S)} " \
                f"(`{command()} send --now` delivers at once)"
     return "queued: no live orchestrator session took it yet; it is retried with your next message and " \
            "delivered when the orchestrator adopts this lane"
@@ -1034,17 +1164,26 @@ def push_report(mailbox: Mailbox, message: dict) -> str:
 
 def cmd_send(args, kind: str) -> str:
     context = lane_context() if not args.orchestrator else None
+    wait = getattr(args, "wait", False)
     if context:
         mailbox, attempt = context
         hold = kind == "note" and not getattr(args, "now", False) and NOTE_HOLD_S > 0 and \
             mailbox.state().get("identity", {}).get(str(attempt)) == IDENTITY_VERSION
-        message = mailbox.write("outbox", kind, body_from(args.words), lane_sender(mailbox, attempt), hold=hold)
-        return f"sent {kind} {message['id']}; {push_report(mailbox, message)}"
+        message = mailbox.write("outbox", kind, body_from(args.words), lane_sender(mailbox, attempt), hold=hold,
+                                wait=wait)
+        report = f"sent {kind} {message['id']}; {push_report(mailbox, message)}"
+        if not wait:
+            return report
+        print(f"{report}\nwaiting up to {span(args.timeout)} for the answer", flush=True)
+        return wait_for_answer(mailbox, attempt, message["id"], args.timeout, heartbeat_file(mailbox, args.heartbeat))
+    if wait:
+        raise LaneError("--wait works only inside a lane")
     if len(args.words) < 2:
         raise LaneError(f"usage: {command()} {kind} <lane> <text>")
     mailbox = resolve_lane(args.words[0])
-    message = mailbox.write("inbox", kind, body_from(args.words[1:]), orchestrator_sender(mailbox))
-    return f"sent {kind} {message['id']} to lane {mailbox.lane['key']}; {lane_delivery_hint(mailbox)}"
+    sender, note = orchestrator_sender(mailbox)
+    message = mailbox.write("inbox", kind, body_from(args.words[1:]), sender)
+    return f"sent {kind} {message['id']} to lane {mailbox.lane['key']}; {lane_delivery_hint(mailbox)}{note}"
 
 
 def cmd_reply(args) -> str:
@@ -1054,23 +1193,38 @@ def cmd_reply(args) -> str:
     found = mailbox.find(args.id)
     if not found or found[0] != queue:
         raise LaneError(f"message {args.id} is not addressed to you")
+    answered = None if context else mailbox.path / "answered" / args.id
+    earlier = read_text(answered) if answered else None
     if found[1] == "done" and found[2]["kind"] == "ask":
-        raise LaneError(f"{args.id} was already answered; use `send` for a follow-up")
+        raise LaneError(f"{args.id} was already answered{f' by {earlier}' if earlier else ''}; use `send` for a "
+                        "follow-up")
     original = found[2]
     if context:
-        sender = lane_sender(mailbox, attempt)
+        sender, note = lane_sender(mailbox, attempt), ""
     else:
-        sender = orchestrator_sender(mailbox)
-    reply_queue = "outbox" if context else "inbox"
-    message = mailbox.write(reply_queue, "reply", body_from(args.words), sender, reply_to=args.id,
-                            quote=clip(original["body"], 300))
+        sender, note = orchestrator_sender(mailbox)
+    if earlier:
+        # An earlier reply wrote the answer and then stopped (for example at a timeout) before closing the question.
+        reply_id, done = earlier, f"an earlier reply {earlier} already answers {args.id}; closed the question"
+    else:
+        message = mailbox.write("outbox" if context else "inbox", "reply", body_from(args.words), sender,
+                                reply_to=args.id, quote=clip(original["body"], 300))
+        reply_id, done = message["id"], f"replied {message['id']} to {args.id}"
+        if answered:
+            answered.parent.mkdir(exist_ok=True)
+            write_atomic(answered, reply_id + "\n")
     mailbox.move(args.id, queue, "done")
-    mailbox.log("answered", id=args.id, reply=message["id"])
+    mailbox.log("answered", id=args.id, reply=reply_id)
     if context:
         file_channel_ack(mailbox, original)
-    if context:
-        return f"replied {message['id']} to {args.id}; {push_report(mailbox, message)}"
-    return f"replied {message['id']} to {args.id}; {lane_delivery_hint(mailbox)}"
+        return f"{done}; {push_report(mailbox, message)}"
+    try:
+        waiting = time.time() - (mailbox.path / "waiting" / args.id).stat().st_mtime < WAITER_FRESH_S
+    except OSError:
+        waiting = False
+    hint = "the lane is waiting in its session and continues at once; do not relaunch it" if waiting \
+        else lane_delivery_hint(mailbox)
+    return f"{done}; {hint}{note}"
 
 
 def cmd_ack(args) -> str:
@@ -1235,7 +1389,7 @@ def cmd_push(args) -> str:
     mail = Path(args.mail)
     if not (mail / "lane.json").exists():
         raise LaneError(f"{mail} is not a lane mailbox")
-    return json.dumps(push_pending(Mailbox(mail), args.min_age, relay=False, flush=args.flush))
+    return json.dumps(push_pending(Mailbox(mail), args.min_age, relay=args.relay, flush=args.flush))
 
 
 def known_orchestrators(within_s: float = 0) -> list:
@@ -1298,6 +1452,11 @@ def main(argv=None) -> int:
         sub.add_argument("words", nargs="+")
         if name == "send":
             sub.add_argument("--now", action="store_true", help="lanes: deliver the note at once instead of holding it")
+        else:
+            sub.add_argument("--wait", action="store_true", help="lanes: block until the orchestrator answers")
+            sub.add_argument("--timeout", type=float, default=WAIT_S, help="seconds --wait waits (default %(default)s)")
+            sub.add_argument("--heartbeat", help="file to append a line to every few minutes while waiting "
+                                                 "(default: the lane's out/HEARTBEAT.log when it exists)")
     sub = commands.add_parser("reply", help="answer a message")
     sub.add_argument("id")
     sub.add_argument("words", nargs="+")
@@ -1339,6 +1498,7 @@ def main(argv=None) -> int:
     sub.add_argument("mail")
     sub.add_argument("--min-age", type=float, default=0.0)
     sub.add_argument("--flush", action="store_true", help="also post held notes")
+    sub.add_argument("--relay", action="store_true", help=argparse.SUPPRESS)
     sub = commands.add_parser("hook", help="Devin hook entry point (reads the event payload on stdin)")
     sub.add_argument("event")
     args = parser.parse_args(argv)

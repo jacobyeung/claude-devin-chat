@@ -115,9 +115,21 @@ use the tool, so new sessions find it without a briefing.
    A lane is named by its key (`distill/research_plan`), the last part of it, its directory, or its hash (the
    prefix of each of its message ids). Messages for the orchestrator name the lane by its short name. Inside a lane
    (where `LANEMSG_DIR` is set) the same commands act for the lane: `lanemsg send [--now] "<text>"`,
-   `lanemsg ask "<text>"`, `lanemsg reply <id> "<text>"`, `lanemsg ack <id>` and `lanemsg inbox`. Pass
+   `lanemsg ask [--wait] "<text>"`, `lanemsg reply <id> "<text>"`, `lanemsg ack <id>` and `lanemsg inbox`. Pass
    `--orchestrator` to act as the orchestrator from inside a lane's environment, and `-` as the text to read it
-   from stdin. When a different session writes to a lane, it takes the lane over.
+   from stdin.
+
+   Only `register`, `run` and `adopt` change which session receives a lane's messages. A different session that
+   writes to a lane takes it over only when the lane has no receiver or this host can tell that the receiver has
+   ended (an orchestrator that restarted on the same host); otherwise the message is delivered, the lane keeps
+   its receiver, and the command's output names that receiver and the `adopt` command. One orchestrator writing
+   to another's lane therefore never redirects that lane's questions.
+
+   `lanemsg reply` is safe to repeat after a timeout: it records each answer in `mail/answered/<question id>`,
+   and a second `reply` to a question whose answer was already written closes the question without writing
+   another answer. Renames retry for about three seconds on the transient errors NFS raises under load (`EBUSY`,
+   `ESTALE`), and a hook that must relay a push over ssh hands it to a detached process instead of making the
+   lane wait.
 
    `lanemsg tell` reaches orchestrators from anywhere, not only from lanes: any agent that stops work an
    orchestrator started tells it so, for example
@@ -125,11 +137,19 @@ use the tool, so new sessions find it without a briefing.
    The note goes to each session's main thread, steered into its running turn or queued as its next turn, and
    from another host it runs over ssh.
 
-4. **Continue a lane that is waiting for you.** A Devin lane that asked a question and cannot continue without
-   the answer ends its turn, and its process exits. After you reply, launch another attempt. Resuming the same
-   session keeps the lane's conversation; `lanemsg status <lane>` shows the session id of each attempt. A
-   fresh session with a continuation brief also works, because open messages and answers reach whichever
-   session of the lane starts next.
+4. **A lane that waits for your answer.** A lane that cannot continue without an answer runs
+   `lanemsg ask --wait "<question>"`. The command blocks in the lane's running session for up to
+   `LANEMSG_WAIT_S` (30 minutes by default), appends a line to the lane's `out/HEARTBEAT.log` every four
+   minutes so lane watchdogs see it alive, and prints the answer when you reply; the lane keeps its context and
+   needs no relaunch. The question reaches you marked "waits in its running session (no relaunch needed)", and
+   `lanemsg reply` says whether the lane is still waiting. After a timeout the question stays open,
+   `mail/answered/<question id>` appears when you answer (a watchdog can wait on that file), and the answer
+   reaches the lane's next session.
+
+   A lane that ended its session instead needs another attempt after you reply. Resuming the same session keeps
+   the lane's conversation; `lanemsg status <lane>` shows the session id of each attempt. A fresh session with a
+   continuation brief also works, because open messages and answers reach whichever session of the lane starts
+   next.
 
    ```bash
    lanemsg run <lane> -- devin -r <session-id> -p "Continue; the orchestrator's answer is in your context."
@@ -187,6 +207,7 @@ lets tools that watch files take part.
 | `LANEMSG_CLAUDE_SESSIONS` | `~/.claude/sessions` | Where Claude Code writes its session files |
 | `CODEX_HOME` | `~/.codex` | Where Codex keeps the app-server daemon's control socket |
 | `LANEMSG_NOTE_HOLD_S` | `1800` | How long a lane's routine note may wait for the lane's next message; `0` sends every note at once |
+| `LANEMSG_WAIT_S` | `1800` | How long `lanemsg ask --wait` blocks before it gives up (`--timeout` overrides it) |
 | `LANEMSG_DIR`, `LANEMSG_ATTEMPT`, `LANEMSG_HOOK`, `LANEMSG_PYTHON`, `LANEMSG_ENGINE` | unset | Lane identity, set by `lanemsg run` or another launcher; the hooks fall back to `/data2/jjyeung/envs/miniforge3/bin/python` |
 
 ## Tests

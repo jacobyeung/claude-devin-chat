@@ -43,6 +43,10 @@ the lane's next question or answer, arrive after about 30 minutes, or arrive whe
 `send --now` when you must act soon, and `lanemsg inbox` shows held notes at any time. Brief lanes to message
 only for questions, blockers and final results; leave routine state to your watchdog.
 
+Writing to a lane that another live session receives does not take it over: the output names the receiver,
+and `lanemsg adopt <lane>` takes the lane over when you mean to. `lanemsg reply` is safe to repeat after a
+timeout; it never writes a second answer.
+
 ## Commands
 
 ```bash
@@ -69,7 +73,10 @@ lanemsg tell all --from "<who you are>" "I stopped <what> on <host> because <why
 
 ## A lane waiting for your answer
 
-A Devin lane that cannot continue without your answer ends its turn and its process exits. After you reply,
+A lane that cannot continue without your answer asks with `lanemsg ask --wait`, which blocks in its running
+session (up to 30 minutes) and keeps its heartbeat fresh. Such a question arrives marked "waits in its running
+session (no relaunch needed)". Reply, and read the reply's output: "the lane is waiting in its session" means
+the lane continues on its own, so do not relaunch it. Any other output means the lane ended its session; then
 launch a new attempt, for example with a continuation brief:
 `lanemsg run <lane> -- devin -p ... --prompt-file <continuation brief>`. The new session receives your answer
 when it starts. Resuming the old session with `devin -r <session-id>` also works when Devin's session store is

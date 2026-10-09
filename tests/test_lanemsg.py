@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import argparse
 import base64
 import contextlib
+import errno
 import hashlib
 import io
 import json
@@ -174,7 +176,7 @@ def test_messages_reach_a_new_session_with_identity_and_commands(lane, monkeypat
     text = context(hook("SessionStart", source="startup"))
     assert "You are lane `r1/ctrl/alpha` (attempt 1)" in text
     assert "use split B" in text and "what is 2+2?" in text
-    assert " reply " in text and " ack " in text and "resumes this same session" in text
+    assert " reply " in text and " ack " in text and "ask --wait" in text
     assert names(mailbox, "inbox", "new") == []
     assert len(names(mailbox, "inbox", "cur")) == 2
     assert mailbox.session_for(1) == "sess-A"
@@ -788,6 +790,117 @@ def test_orchestrator_inbox_shows_and_takes_held_notes(lane, monkeypatch, capsys
     out = cli(capsys, "inbox")[1]
     assert out.startswith("[held] [lanemsg] NOTE from lane alpha (attempt 1)") and "fyi" in out
     assert names(mailbox, "outbox", "new") == [] and len(names(mailbox, "outbox", "done")) == 1
+
+
+def test_ask_wait_blocks_in_session_until_the_orchestrator_answers(lane, monkeypatch, capsys, fake_claude):
+    mailbox = lane()
+    heartbeat = mailbox.path.parent / "out" / "HEARTBEAT.log"
+    heartbeat.parent.mkdir()
+    heartbeat.write_text("")
+    as_lane(monkeypatch, mailbox)
+    hook("SessionStart", source="startup")
+    mailbox.set_orchestrator({"agent": "claude", "session_id": ORCHESTRATOR_ID}, "test")
+    monkeypatch.setattr(lanemsg, "WAIT_POLL_S", 0.05)
+    replies = []
+
+    def orchestrator():
+        for _ in range(400):
+            asked = names(mailbox, "outbox", "cur")
+            if asked and (mailbox.path / "waiting" / asked[0]).exists():
+                replies.append(lanemsg.cmd_reply(argparse.Namespace(orchestrator=True, id=asked[0], words=["seed 7"])))
+                return
+            time.sleep(0.02)
+    helper = threading.Thread(target=orchestrator)
+    helper.start()
+    code, out, _ = cli(capsys, "ask", "--wait", "--timeout", "20", "which seed?")
+    helper.join()
+    assert code == 0 and "ANSWER from orchestrator fake-orch to your question" in out and out.endswith("seed 7")
+    assert "waits in its running session (no relaunch needed)" in fake_claude[-1]["message"]["content"]
+    assert "waiting in its session" in replies[0] and "do not relaunch" in replies[0]
+    assert names(mailbox, "inbox", "new") == [] and len(names(mailbox, "inbox", "done")) == 1
+    assert hook("PostToolUse", tool_name="exec") is None
+    assert "waiting for the orchestrator's answer" in heartbeat.read_text()
+
+
+def test_ask_wait_gives_up_cleanly_after_its_timeout(lane, monkeypatch, capsys, fake_claude):
+    mailbox = lane()
+    as_lane(monkeypatch, mailbox)
+    mailbox.set_orchestrator({"agent": "claude", "session_id": ORCHESTRATOR_ID}, "test")
+    monkeypatch.setattr(lanemsg, "WAIT_POLL_S", 0.05)
+    code, _, err = cli(capsys, "ask", "--wait", "--timeout", "0.2", "which seed?")
+    question_id = names(mailbox, "outbox", "cur")[0]
+    assert code == 1 and "no answer after" in err and f"answered/{question_id}" in err
+    as_orchestrator(monkeypatch)
+    code, out, _ = cli(capsys, "reply", question_id, "seed 7")
+    assert code == 0 and "do not relaunch" not in out
+    assert (mailbox.path / "answered" / question_id).read_text().strip() == names(mailbox, "inbox", "new")[0]
+
+
+def test_another_live_sessions_lane_keeps_its_receiver(lane, capsys, fake_claude):
+    mailbox = lane()
+    sessions = Path(os.environ["LANEMSG_CLAUDE_SESSIONS"])
+    other_sock = os.path.join(tempfile.mkdtemp(prefix="lm", dir="/tmp"), "other.sock")
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(other_sock)
+    start = Path(f"/proc/{os.getppid()}/stat").read_text().rsplit(")", 1)[1].split()[19]
+    other_id = "99999999-2222-3333-4444-555555555555"
+    (sessions / f"{os.getppid()}.json").write_text(json.dumps({
+        "pid": os.getppid(), "procStart": start, "sessionId": other_id, "name": "distill-orch",
+        "messagingSocketPath": other_sock}))
+    mailbox.set_orchestrator({"agent": "claude", "session_id": other_id, "name": "distill-orch",
+                              "host": socket.gethostname()}, "register")
+    code, out, _ = cli(capsys, "send", "alpha", "a note from another orchestrator")
+    assert code == 0 and "still reports to orchestrator distill-orch" in out and "adopt alpha" in out
+    assert mailbox.orchestrator()["session_id"] == other_id
+    (sessions / f"{os.getppid()}.json").rename(sessions / "ended.json.old")
+    cli(capsys, "send", "alpha", "the old receiver has ended")
+    assert mailbox.orchestrator()["session_id"] == ORCHESTRATOR_ID
+    server.close()
+
+
+def test_a_reply_retried_after_a_timeout_does_not_answer_twice(lane, monkeypatch, capsys):
+    mailbox = lane()
+    as_lane(monkeypatch, mailbox)
+    cli(capsys, "ask", "which seed?")
+    question_id = names(mailbox, "outbox", "new")[0]
+    as_orchestrator(monkeypatch)
+    real_move = lanemsg.Mailbox.move
+
+    def interrupted(self, *args, **kwargs):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(lanemsg.Mailbox, "move", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        lanemsg.main(["reply", question_id, "seed 7"])
+    monkeypatch.setattr(lanemsg.Mailbox, "move", real_move)
+    code, out, _ = cli(capsys, "reply", question_id, "seed 7")
+    assert code == 0 and "already answers" in out
+    assert len(names(mailbox, "inbox", "new")) == 1 and names(mailbox, "outbox", "done") == [question_id]
+    code, _, err = cli(capsys, "reply", question_id, "seed 8")
+    assert code == 1 and "already answered by" in err
+
+
+def test_renames_retry_the_transient_errors_nfs_raises_under_load(tmp_path, monkeypatch):
+    real_replace, calls = os.replace, []
+
+    def flaky(source, target):
+        calls.append(target)
+        if len(calls) < 3:
+            raise OSError(errno.EBUSY, "Device or resource busy")
+        real_replace(source, target)
+    monkeypatch.setattr(lanemsg.os, "replace", flaky)
+    monkeypatch.setattr(lanemsg.time, "sleep", lambda seconds: None)
+    lanemsg.write_atomic(tmp_path / "state.json", "{}\n")
+    assert len(calls) == 3 and (tmp_path / "state.json").read_text() == "{}\n"
+
+
+def test_hooks_hand_a_cross_host_push_to_a_detached_process(lane, monkeypatch):
+    mailbox = lane()
+    codex_orchestrator(mailbox, host="orchestrator-host")
+    spawned = []
+    monkeypatch.setattr(lanemsg.subprocess, "Popen", lambda argv, **kwargs: spawned.append((argv, kwargs)))
+    lanemsg.push_quietly(mailbox, flush=True)
+    argv, kwargs = spawned[0]
+    assert argv[3:6] == ["push", "--relay", "--flush"] and kwargs["start_new_session"] is True
 
 
 def test_websocket_frames_round_trip_at_every_length_encoding():
