@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "sh -c 'test -n \"$LANEMSG_HOOK\" || exit 0; exec \"${LANEMSG_PYTHON:-python3}\" -I \"$LANEMSG_HOOK\" hook SessionStart'",
+        "timeout": 30
+      }
+    ],
+    "beforeSubmitPrompt": [
+      {
+        "command": "sh -c 'test -n \"$LANEMSG_HOOK\" || exit 0; exec \"${LANEMSG_PYTHON:-python3}\" -I \"$LANEMSG_HOOK\" hook UserPromptSubmit'",
+        "timeout": 30
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "sh -c 'test -n \"$LANEMSG_HOOK\" || exit 0; exec \"${LANEMSG_PYTHON:-python3}\" -I \"$LANEMSG_HOOK\" hook PostToolUse'",
+        "timeout": 30
+      }
+    ],
+    "preCompact": [
+      {
+        "command": "sh -c 'test -n \"$LANEMSG_HOOK\" || exit 0; exec \"${LANEMSG_PYTHON:-python3}\" -I \"$LANEMSG_HOOK\" hook PostCompaction'",
+        "timeout": 30
+      }
+    ],
+    "stop": [
+      {
+        "command": "sh -c 'test -n \"$LANEMSG_HOOK\" || exit 0; exec \"${LANEMSG_PYTHON:-python3}\" -I \"$LANEMSG_HOOK\" hook Stop'",
+        "timeout": 30,
+        "loop_limit": null
+      }
+    ]
+  }
+}

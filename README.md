@@ -5,9 +5,9 @@ delegated work (**lanes**). The orchestrator sends notes and questions to a lane
 notes, questions and answers back, and they arrive as user messages in the session that launched the lane.
 
 Everything is one dependency-free Python script, [`lanemsg.py`](lanemsg.py): a CLI for both sides plus the
-handler for Devin's lifecycle hooks. Codex lanes are supported by polling. The defaults fit the Trinity
-cluster: the script runs `/data2/jjyeung/envs/miniforge3/bin/python`, and the lane registry and lane folders
-live under `/data2/jjyeung/lanemsg`.
+handler for Devin's and Cursor CLI's lifecycle hooks. Codex lanes are supported by polling. Set `LANEMSG_HOME`
+to the directory that holds the lane registry and mailboxes, and use that same path on every machine that
+shares lanes. The script runs `python3`.
 
 ## How it works
 
@@ -48,38 +48,42 @@ live under `/data2/jjyeung/lanemsg`.
 
 ## Requirements
 
-- Linux (`/proc`, `flock`, Unix sockets) and Python 3.8 or newer; no third-party packages. The shebang names
-  the Trinity interpreter; elsewhere, run `python3 lanemsg.py` or edit the shebang.
+- Linux (`/proc`, `flock`, Unix sockets) and Python 3.8 or newer; no third-party packages. Run `python3 lanemsg.py`
+  or the `lanemsg` command on `PATH`.
 - Devin CLI with hooks support. Developed with Devin CLI 3000.11.3.
 - For a Claude Code orchestrator: per-session messaging sockets (its session files in `~/.claude/sessions/`
   include `messagingSocketPath`). Developed with Claude Code 2.1.292.
 - For a Codex orchestrator: a session hosted by the Codex app-server daemon, which is how a plain `codex`
   starts in Codex 0.160. A TUI started with `-c` overrides runs its own in-process server, which lanemsg
   cannot reach. Developed with Codex CLI 0.160.1.
-- Lanes on several hosts need the mailboxes and the registry on a shared filesystem (`/data2` on Trinity), and
-  passwordless ssh from each lane's host to the orchestrator's host.
+- Lanes on several hosts need `LANEMSG_HOME` on a filesystem they all share, and passwordless ssh from each
+  lane's host to the orchestrator's host.
 
 ## Install
 
 ```bash
-git clone https://github.com/jacobyeung/claude-devin-chat.git /data2/jjyeung/claude-devin-chat
-ln -s /data2/jjyeung/claude-devin-chat/lanemsg.py ~/.local/bin/lanemsg
-lanemsg install-hooks                    # every project, via ~/.config/devin/config.json
-ln -s /data2/jjyeung/claude-devin-chat/skills/lanemsg ~/.codex/skills/lanemsg
-ln -s /data2/jjyeung/claude-devin-chat/skills/lanemsg ~/.claude/skills/lanemsg
+git clone https://github.com/jacobyeung/claude-devin-chat.git ~/claude-devin-chat
+ln -s ~/claude-devin-chat/lanemsg.py ~/.local/bin/lanemsg
+export LANEMSG_HOME=~/lanemsg          # one shared directory for every machine that shares lanes
+lanemsg install-hooks                  # Devin, via ~/.config/devin/config.json
+lanemsg install-hooks --cursor         # Cursor CLI, via ~/.cursor/hooks.json
+ln -s ~/claude-devin-chat/skills/lanemsg ~/.codex/skills/lanemsg
+ln -s ~/claude-devin-chat/skills/lanemsg ~/.claude/skills/lanemsg
+ln -s ~/claude-devin-chat/skills/lanemsg ~/.cursor/skills/lanemsg
 ```
 
 `lanemsg install-hooks` merges the hooks into the user's Devin config and keeps the other settings and hooks
 there; `lanemsg install-hooks /path/to/project` writes them to `<project>/.devin/hooks.v1.json` instead, and
 the result is [`examples/hooks.v1.json`](examples/hooks.v1.json). Install them in one place only, because
 hooks in both places run twice. Running either command again changes nothing. Inside Devin, `/hooks` lists the
-loaded hooks. The [`lanemsg` skill](skills/lanemsg/SKILL.md) tells Codex and Claude Code orchestrators how to
-use the tool, so new sessions find it without a briefing.
+loaded hooks. `lanemsg install-hooks --cursor` merges the same no-op-unless-a-lane commands into
+`~/.cursor/hooks.json` and keeps the other Cursor hooks. The [`lanemsg` skill](skills/lanemsg/SKILL.md) tells
+Codex, Claude Code, and Cursor orchestrators how to use the tool, so new sessions find it without a briefing.
 
 ## Quick start
 
 1. **Register a lane** from the shell of the session that will supervise it, the main orchestrator or one of
-   its subagents. This creates the lane's mailbox under `/data2/jjyeung/lanemsg/lanes` (or at an absolute
+   its subagents. This creates the lane's mailbox under `$LANEMSG_HOME/lanes` (or at an absolute
    path), adds it to the registry, and records the calling Claude Code or Codex session and thread. lanemsg
    finds them by walking up the process tree.
 
@@ -133,7 +137,7 @@ use the tool, so new sessions find it without a briefing.
 
    `lanemsg tell` reaches orchestrators from anywhere, not only from lanes: any agent that stops work an
    orchestrator started tells it so, for example
-   `lanemsg tell all --from "Devin" "I stopped lane X on trinity-2-23 because Y; restart it whenever you want."`
+   `lanemsg tell all --from "Devin" "I stopped lane X on other-host because Y; restart it whenever you want."`
    The note goes to each session's main thread, steered into its running turn or queued as its next turn, and
    from another host it runs over ssh.
 
@@ -194,6 +198,20 @@ one (`running`, `parked` and `waiting` get delivery hints).
 Codex lanes have no hooks. Launch them with `lanemsg run <lane> -- codex ...` and tell them in their prompt to
 run `lanemsg inbox` between work steps; it delivers new messages and lists open ones.
 
+## Cursor CLI lanes
+
+Launch a Cursor CLI lane with `lanemsg run <lane> -- agent ...` after `lanemsg install-hooks --cursor`. `run`
+sets `LANEMSG_ENGINE=cursor` when `agent` resolves to the `cursor-agent` binary. The hooks do nothing in a
+process that is not a lane.
+
+```bash
+lanemsg run <lane> -- agent -p -f --sandbox disabled --trust --workspace <project> "$(cat brief.md)"
+```
+
+`--sandbox disabled` lets the lane write its mailbox. The lane waits with `lanemsg ask --wait`, as a Devin
+lane does. The next prompt or tool call injects open messages. `stop` continues the lane while a message is
+undelivered or a question is unanswered, and it stays quiet when the turn was aborted or failed.
+
 Files named `ORCHESTRATOR_NOTE_*.md` dropped into a lane directory are imported as notes; acknowledging one
 appends `ACK <file name>` to the lane's `HEARTBEAT.md`. Together with the `TO_ORCHESTRATOR_*.md` copies, this
 lets tools that watch files take part.
@@ -202,16 +220,17 @@ lets tools that watch files take part.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `LANEMSG_REGISTRY` | `/data2/jjyeung/lanemsg/registry` | Lane registry, one JSON file per lane; the orchestrator and its lanes must share it |
-| `LANEMSG_RUNS_ROOT` | `/data2/jjyeung/lanemsg/lanes` | Where relative lane names go; lane keys are lane directories relative to it, or absolute paths for lanes outside it |
+| `LANEMSG_HOME` | required | Directory that holds the registry and lane mailboxes; the same path on every machine that shares lanes |
+| `LANEMSG_REGISTRY` | `$LANEMSG_HOME/registry` | Lane registry, one JSON file per lane; the orchestrator and its lanes must share it |
+| `LANEMSG_RUNS_ROOT` | `$LANEMSG_HOME/lanes` | Where relative lane names go; lane keys are lane directories relative to it, or absolute paths for lanes outside it |
 | `LANEMSG_CLAUDE_SESSIONS` | `~/.claude/sessions` | Where Claude Code writes its session files |
 | `CODEX_HOME` | `~/.codex` | Where Codex keeps the app-server daemon's control socket |
 | `LANEMSG_NOTE_HOLD_S` | `1800` | How long a lane's routine note may wait for the lane's next message; `0` sends every note at once |
 | `LANEMSG_WAIT_S` | `1800` | How long `lanemsg ask --wait` blocks before it gives up (`--timeout` overrides it) |
-| `LANEMSG_DIR`, `LANEMSG_ATTEMPT`, `LANEMSG_HOOK`, `LANEMSG_PYTHON`, `LANEMSG_ENGINE` | unset | Lane identity, set by `lanemsg run` or another launcher; the hooks fall back to `/data2/jjyeung/envs/miniforge3/bin/python` |
+| `LANEMSG_DIR`, `LANEMSG_ATTEMPT`, `LANEMSG_HOOK`, `LANEMSG_PYTHON`, `LANEMSG_ENGINE` | unset | Lane identity, set by `lanemsg run` or another launcher; the hooks fall back to `python3` |
 
 ## Tests
 
 ```bash
-python -m pytest tests     # any Python 3.8+ with pytest, e.g. /data2/jjyeung/envs/spatialclaw/bin/python
+python -m pytest tests     # any Python 3.8+ with pytest
 ```

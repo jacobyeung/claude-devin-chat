@@ -409,16 +409,20 @@ def test_example_hooks_file_matches_what_install_hooks_writes():
     assert json.loads((REPO / "examples" / "hooks.v1.json").read_text()) == lanemsg.hooks_config()
 
 
-def test_default_locations_are_on_the_trinity_data_directory(tmp_path, monkeypatch):
-    for key in ("LANEMSG_RUNS_ROOT", "LANEMSG_REGISTRY", "LANEMSG_CLAUDE_SESSIONS", "CODEX_HOME"):
+def test_lane_storage_comes_from_lanemsg_home(tmp_path, monkeypatch):
+    for key in ("LANEMSG_HOME", "LANEMSG_RUNS_ROOT", "LANEMSG_REGISTRY", "LANEMSG_CLAUDE_SESSIONS", "CODEX_HOME"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    assert lanemsg.runs_root() == Path("/data2/jjyeung/lanemsg/lanes")
-    assert lanemsg.registry() == Path("/data2/jjyeung/lanemsg/registry")
+    with pytest.raises(lanemsg.LaneError, match="LANEMSG_HOME"):
+        lanemsg.runs_root()
+    home = tmp_path / "shared"
+    monkeypatch.setenv("LANEMSG_HOME", str(home))
+    assert lanemsg.runs_root() == home / "lanes"
+    assert lanemsg.registry() == home / "registry"
     assert lanemsg.claude_sessions() == tmp_path / "home" / ".claude" / "sessions"
     assert lanemsg.codex_home() == tmp_path / "home" / ".codex"
     command = lanemsg.hooks_config()["Stop"][0]["hooks"][0]["command"]
-    assert "${LANEMSG_PYTHON:-/data2/jjyeung/envs/miniforge3/bin/python}" in command
+    assert "${LANEMSG_PYTHON:-python3}" in command
 
 
 def test_hook_failures_never_break_the_lane(lane, monkeypatch, capsys):
@@ -686,8 +690,8 @@ def test_register_records_the_calling_session_and_run_starts_numbered_attempts(t
 
 
 def test_orchestrators_named_by_hand():
-    assert lanemsg.parse_target(f"codex:{CODEX_ID}@trinity-3-13") == \
-        {"agent": "codex", "session_id": CODEX_ID, "host": "trinity-3-13"}
+    assert lanemsg.parse_target(f"codex:{CODEX_ID}@other-host") == \
+        {"agent": "codex", "session_id": CODEX_ID, "host": "other-host"}
     assert lanemsg.parse_target("fake-orch") == {"agent": "claude", "name": "fake-orch"}
     assert lanemsg.parse_target(f"claude:{ORCHESTRATOR_ID}") == {"agent": "claude", "session_id": ORCHESTRATOR_ID}
 
@@ -901,6 +905,93 @@ def test_hooks_hand_a_cross_host_push_to_a_detached_process(lane, monkeypatch):
     lanemsg.push_quietly(mailbox, flush=True)
     argv, kwargs = spawned[0]
     assert argv[3:6] == ["push", "--relay", "--flush"] and kwargs["start_new_session"] is True
+
+
+def test_cursor_hooks_example_matches_install():
+    assert json.loads((REPO / "examples" / "cursor-hooks.json").read_text()) == \
+        {"version": 1, "hooks": lanemsg.cursor_hooks_config()}
+
+
+def test_install_hooks_merges_into_the_cursor_user_config(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    path = home / ".cursor" / "hooks.json"
+    path.parent.mkdir(parents=True)
+    guard = {"command": "python3 /tmp/rm_guard.py", "matcher": "Delete", "timeout": 5}
+    path.write_text(json.dumps({"version": 1, "hooks": {"preToolUse": [guard]}}))
+    path.chmod(0o600)
+    for _ in range(2):
+        assert lanemsg.main(["install-hooks", "--cursor"]) == 0
+    config = json.loads(path.read_text())
+    assert config["version"] == 1 and path.stat().st_mode & 0o777 == 0o600
+    assert config["hooks"]["preToolUse"] == [guard]
+    assert {event: entries for event, entries in config["hooks"].items() if event != "preToolUse"} == \
+        lanemsg.cursor_hooks_config()
+    command = config["hooks"]["postToolUse"][0]["command"]
+    env = {key: value for key, value in os.environ.items() if not key.startswith("LANEMSG_")}
+    result = subprocess.run(command, shell=True, input='{"conversation_id": "x"}', capture_output=True, text=True,
+                            env=env)
+    assert result.returncode == 0 and result.stdout == ""
+
+
+def test_cursor_lane_delivers_on_the_next_prompt_and_follows_up_on_stop(lane, monkeypatch, capsys):
+    mailbox = lane()
+    as_lane(monkeypatch, mailbox, engine="cursor")
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"conversation_id": "conv-1", "session_id": "other"})))
+    assert lanemsg.hook_main("SessionStart") == 0
+    started = json.loads(capsys.readouterr().out)
+    assert "You are lane `r1/ctrl/alpha`" in started["additional_context"]
+    assert mailbox.session_for(1) == "conv-1"
+    cli(capsys, "--orchestrator", "send", "alpha", "use split B")
+    as_lane(monkeypatch, mailbox, engine="cursor")
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"conversation_id": "conv-1"})))
+    assert lanemsg.hook_main("UserPromptSubmit") == 0
+    delivered = json.loads(capsys.readouterr().out)
+    assert "use split B" in delivered["additional_context"]
+    assert names(mailbox, "inbox", "new") == []
+    cli(capsys, "--orchestrator", "ask", "alpha", "ready to merge?")
+    as_lane(monkeypatch, mailbox, engine="cursor")
+    assert hook("PostToolUse", conversation_id="conv-sub", subagent_id="sub-1", tool_name="Shell") is None
+    assert len(names(mailbox, "inbox", "new")) == 1
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"conversation_id": "conv-1", "status": "aborted"})))
+    assert lanemsg.hook_main("Stop") == 0 and capsys.readouterr().out == ""
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"conversation_id": "conv-1", "status": "completed"})))
+    assert lanemsg.hook_main("Stop") == 0
+    followed = json.loads(capsys.readouterr().out)
+    assert "ready to merge?" in followed["followup_message"]
+
+
+def test_a_devin_hook_still_prints_devin_output(lane, monkeypatch, capsys):
+    mailbox = lane()
+    as_lane(monkeypatch, mailbox)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"session_id": "sess-A"})))
+    assert lanemsg.hook_main("SessionStart") == 0
+    output = json.loads(capsys.readouterr().out)
+    assert "You are lane" in output["hookSpecificOutput"]["additionalContext"]
+
+
+def test_agent_is_a_cursor_lane_only_when_it_is_cursor_agent(tmp_path, monkeypatch, capsys, lane):
+    lane()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    target = bindir / "cursor-agent"
+    target.write_text("#!/bin/sh\nexit 0\n")
+    target.chmod(0o755)
+    (bindir / "agent").symlink_to(target)
+    other = bindir / "other-agent"
+    other.write_text("#!/bin/sh\nexit 0\n")
+    other.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
+    launched = []
+    monkeypatch.setattr(lanemsg.os, "execve", lambda path, argv, env: launched.append((argv, env)))
+    code, _, err = cli(capsys, "run", "alpha", "--", "agent", "-p", "hi")
+    assert code == 0 and launched[-1][1]["LANEMSG_ENGINE"] == "cursor" and "install-hooks --cursor" in err
+    assert lanemsg.main(["install-hooks", "--cursor"]) == 0
+    assert cli(capsys, "run", "alpha", "--", "agent", "-p", "hi")[2] == ""
+    assert launched[-1][1]["LANEMSG_ENGINE"] == "cursor"
+    assert cli(capsys, "run", "alpha", "--", "other-agent", "-p", "hi")[0] == 0
+    assert launched[-1][1]["LANEMSG_ENGINE"] == "devin"
 
 
 def test_websocket_frames_round_trip_at_every_length_encoding():

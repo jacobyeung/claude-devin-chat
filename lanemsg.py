@@ -1,4 +1,4 @@
-#!/data2/jjyeung/envs/miniforge3/bin/python -I
+#!/usr/bin/env python3
 """Durable two-way messages between an orchestrator and its Devin or Codex lanes.
 
 Each lane owns a mailbox, `<lane dir>/mail`, with two Maildir-style queues: `inbox/` (orchestrator to lane)
@@ -17,7 +17,8 @@ the main session, gets each message steered into its running turn, and an answer
 asked the question. When that thread runs no turn, the main session gets the message, steered into its running
 turn or queued as its next turn. A lane on another host relays the push over ssh. A push that fails is retried
 with the lane's next message, by `lanemsg adopt`, or by the lane's launcher. Codex lanes have no hooks and run
-`lanemsg inbox` between work steps.
+`lanemsg inbox` between work steps. Cursor CLI lanes (`agent`, when it resolves to `cursor-agent`) receive
+messages through the same hooks, installed with `lanemsg install-hooks --cursor`.
 
 Every push starts a turn over the orchestrator's whole context, so a lane's routine notes wait. A note from an
 attempt whose instructions describe the hold travels with the lane's next question or answer, goes out once it
@@ -30,8 +31,8 @@ once `reply` records the answer in mail/answered/<question id>.
 environment. The hooks bind an attempt to the first Devin session that reports in, so nested Devin processes
 that inherit the environment cannot consume the lane's messages.
 
-The defaults fit the Trinity cluster: the registry and lane folders live under /data2/jjyeung/lanemsg, and the
-script and its hooks run /data2/jjyeung/envs/miniforge3/bin/python.
+Set LANEMSG_HOME to the directory that holds the registry and mailboxes. Every machine that shares lanes
+uses the same path. The hooks run python3 unless LANEMSG_PYTHON names another interpreter.
 """
 from __future__ import annotations
 
@@ -66,8 +67,7 @@ SUBAGENT_TOOLS = (SUBAGENT_TOOL, "read_subagent")
 BACKGROUND_SUBAGENT_HOLD_S = 600
 FOREGROUND_SUBAGENT_HOLD_S = 3 * 3600
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-DATA_ROOT = Path("/data2/jjyeung/lanemsg")
-PYTHON = "/data2/jjyeung/envs/miniforge3/bin/python"
+PYTHON = "python3"
 TELL_ACTIVE_S = 24 * 3600
 NOTE_HOLD_S = float(os.environ.get("LANEMSG_NOTE_HOLD_S") or 1800)
 HOOK_PUSH_INTERVAL_S = 300
@@ -83,12 +83,21 @@ class LaneError(Exception):
     pass
 
 
+def data_root() -> Path:
+    """The shared lane directory. Required, so a machine never writes a private mailbox by accident."""
+    value = os.environ.get("LANEMSG_HOME")
+    if not value:
+        raise LaneError("LANEMSG_HOME is not set. Set it to the directory that holds the lane registry and "
+                        "mailboxes, and use that same path on every machine that shares lanes.")
+    return Path(value)
+
+
 def runs_root() -> Path:
-    return Path(os.environ.get("LANEMSG_RUNS_ROOT") or DATA_ROOT / "lanes")
+    return Path(os.environ.get("LANEMSG_RUNS_ROOT") or data_root() / "lanes")
 
 
 def registry() -> Path:
-    return Path(os.environ.get("LANEMSG_REGISTRY") or DATA_ROOT / "registry")
+    return Path(os.environ.get("LANEMSG_REGISTRY") or data_root() / "registry")
 
 
 def claude_sessions() -> Path:
@@ -924,7 +933,11 @@ def run_hook(event: str, payload: dict) -> dict | None:
     if not mail_dir or not attempt or not (Path(mail_dir) / "lane.json").exists():
         return None
     mailbox = Mailbox(Path(mail_dir))
-    session_id = payload.get("session_id") or ""
+    cursor = os.environ.get("LANEMSG_ENGINE") == "cursor"
+    session_id = str(payload.get("conversation_id") or payload.get("session_id") or "") if cursor else \
+        (payload.get("session_id") or "")
+    if cursor and (payload.get("subagent_id") or payload.get("parent_conversation_id")):
+        return None
     subagent_call = payload.get("tool_name") in SUBAGENT_TOOLS
     import_file_notes(mailbox)
     if event in ("PostToolUse", "UserPromptSubmit") and notes_due(mailbox):
@@ -945,12 +958,20 @@ def run_hook(event: str, payload: dict) -> dict | None:
         return None
     if event == "Stop":
         push_quietly(mailbox, flush=True)
+        if cursor and payload.get("status") in ("aborted", "error"):
+            return None
         return stop_decision(mailbox, attempt, session_id)
     if event == "SessionStart":
         def start(state):
             state.get("subagents", {}).pop(session_id, None)
             state.setdefault("identity", {})[str(attempt)] = IDENTITY_VERSION
+            if cursor:
+                state.setdefault("reinject", {})[session_id] = True
         mailbox.update_state(start)
+        if cursor:
+            # sessionStart can be fire-and-forget. Leave the inbox for the next hook, which the model does read.
+            text = identity_block(mailbox, attempt)
+            return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}} if text else None
         parts = [identity_block(mailbox, attempt), open_items_block(mailbox, session_id)]
     elif event in ("UserPromptSubmit", "PostToolUse"):
         reinject = mailbox.update_state(lambda state: state.get("reinject", {}).pop(session_id, None))
@@ -987,10 +1008,23 @@ def stop_decision(mailbox: Mailbox, attempt, session_id: str) -> dict | None:
                                                                 "answer; reply before you stop:")}
 
 
+def present_hook(event: str, output: dict | None) -> dict | None:
+    """Cursor reads additional_context and followup_message. Devin keeps its own hook output."""
+    if os.environ.get("LANEMSG_ENGINE") != "cursor" or not output:
+        return output
+    if event == "Stop":
+        reason = output.get("reason")
+        if output.get("decision") == "block" and isinstance(reason, str) and reason.strip():
+            return {"followup_message": reason}
+        return None
+    text = (output.get("hookSpecificOutput") or {}).get("additionalContext")
+    return {"additional_context": text} if isinstance(text, str) and text else None
+
+
 def hook_main(event: str) -> int:
     try:
         raw = sys.stdin.read()
-        output = run_hook(event, json.loads(raw) if raw.strip() else {})
+        output = present_hook(event, run_hook(event, json.loads(raw) if raw.strip() else {}))
         if output:
             print(json.dumps(output))
     except Exception:
@@ -1325,8 +1359,69 @@ def hooks_config() -> dict:
     return config
 
 
+CURSOR_HOOK_EVENTS = (
+    ("sessionStart", "SessionStart"),
+    ("beforeSubmitPrompt", "UserPromptSubmit"),
+    ("postToolUse", "PostToolUse"),
+    ("preCompact", "PostCompaction"),
+    ("stop", "Stop"),
+)
+
+
+def cursor_hook_command(event: str) -> str:
+    script = (f'test -n "$LANEMSG_HOOK" || exit 0; exec "${{LANEMSG_PYTHON:-{PYTHON}}}" -I "$LANEMSG_HOOK" '
+              f"hook {event}")
+    return f"sh -c {shlex.quote(script)}"
+
+
+def cursor_hooks_config() -> dict:
+    """Cursor CLI hooks. They exit immediately unless the process is a lanemsg lane."""
+    config = {}
+    for cursor_event, internal in CURSOR_HOOK_EVENTS:
+        entry = {"command": cursor_hook_command(internal), "timeout": 30}
+        if cursor_event == "stop":
+            entry["loop_limit"] = None
+        config[cursor_event] = [entry]
+    return config
+
+
+def cursor_hooks_path(project: str | None = None) -> Path:
+    return Path(project).resolve() / ".cursor" / "hooks.json" if project else Path.home() / ".cursor" / "hooks.json"
+
+
+def cursor_hooks_installed() -> bool:
+    return "LANEMSG_HOOK" in (read_text(cursor_hooks_path()) or "")
+
+
+def lane_engine(executable: str) -> str:
+    """Which CLI this launch is. `agent` counts only when it resolves to the Cursor `cursor-agent` binary."""
+    if Path(executable).name == "codex":
+        return "codex"
+    resolved = os.path.realpath(executable)
+    if Path(resolved).name == "cursor-agent" or f"{os.sep}cursor-agent{os.sep}" in resolved:
+        return "cursor"
+    return "devin"
+
+
+def install_cursor_hooks(project: str | None) -> str:
+    path = cursor_hooks_path(project)
+    config = read_json(path) if path.exists() else {"version": 1, "hooks": {}}
+    hooks = config.get("hooks", {}) if isinstance(config, dict) else None
+    if not isinstance(config, dict) or not isinstance(hooks, dict):
+        raise LaneError(f"{path} does not hold a JSON object of hooks; fix it by hand first")
+    merged = dict(hooks)
+    for event, entries in cursor_hooks_config().items():
+        merged[event] = [item for item in merged.get(event, []) if "LANEMSG_HOOK" not in json.dumps(item)] + entries
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_atomic(path, json.dumps({**config, "version": config.get("version", 1), "hooks": merged}, indent=2) + "\n")
+    return f"installed lanemsg hooks in {path}"
+
+
 def cmd_install_hooks(args) -> str:
-    """Merge the hooks into <project>/.devin/hooks.v1.json, or into the user's Devin config (all projects)."""
+    """Merge the hooks into <project>/.devin/hooks.v1.json, or into the user's Devin config (all projects).
+    With --cursor, merge Cursor CLI hooks into ~/.cursor/hooks.json or <project>/.cursor/hooks.json."""
+    if args.cursor:
+        return install_cursor_hooks(args.project)
     path = Path(args.project).resolve() / ".devin" / "hooks.v1.json" if args.project else devin_user_config()
     config = read_json(path) if path.exists() else {}
     hooks = config if args.project else config.get("hooks", {}) if isinstance(config, dict) else None
@@ -1375,7 +1470,11 @@ def cmd_run(args) -> str:
     launcher = orchestrator_ancestor()
     if launcher:
         mailbox.set_orchestrator(launcher, "run")
-    attempt, engine = mailbox.reserve_attempt(), "codex" if Path(argv[0]).name == "codex" else "devin"
+    engine = lane_engine(executable)
+    if engine == "cursor" and not cursor_hooks_installed():
+        print("lanemsg: WARNING: Cursor hooks are not installed, so this lane will not see messages; "
+              f"run `{command()} install-hooks --cursor` and relaunch", file=sys.stderr, flush=True)
+    attempt = mailbox.reserve_attempt()
     mailbox.log("launched", attempt=str(attempt), engine=engine, host=socket.gethostname(), argv=argv)
     env = {**os.environ, "LANEMSG_DIR": str(mailbox.path.resolve()), "LANEMSG_ATTEMPT": str(attempt),
            "LANEMSG_HOOK": str(SELF), "LANEMSG_PYTHON": sys.executable, "LANEMSG_ENGINE": engine}
@@ -1474,7 +1573,7 @@ def main(argv=None) -> int:
     sub = commands.add_parser("lanes", help="list registered lanes")
     sub.add_argument("--all", action="store_true")
     sub = commands.add_parser("register", help="create a lane's mailbox; the calling session becomes its orchestrator")
-    sub.add_argument("lane_dir", help=f"lane directory; a relative path goes under the lanes root, {runs_root()}")
+    sub.add_argument("lane_dir", help="lane directory; a relative path goes under $LANEMSG_HOME/lanes")
     sub.add_argument("--name", help="short lane name (default: the directory's name)")
     sub.add_argument("--run-root", help="directory that holds the run's lanes (default: the lane directory's parent)")
     sub.add_argument("--session", help="orchestrator session, when register does not run inside it: "
@@ -1487,6 +1586,8 @@ def main(argv=None) -> int:
     sub = commands.add_parser("install-hooks", help="merge the generic Devin hooks into <project>/.devin/hooks.v1.json"
                                                     ", or into ~/.config/devin/config.json without a project")
     sub.add_argument("project", nargs="?")
+    sub.add_argument("--cursor", action="store_true",
+                     help="merge Cursor CLI hooks into ~/.cursor/hooks.json, or <project>/.cursor/hooks.json")
     sub = commands.add_parser("orchestrators", help="list the orchestrator sessions that registered lanes name")
     sub = commands.add_parser("tell", help="send a note straight to orchestrator sessions: tell <session|all> <text>")
     sub.add_argument("session", help="'all' (every session with lane activity in the last day), a session id, "

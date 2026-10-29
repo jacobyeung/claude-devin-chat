@@ -1,19 +1,19 @@
 ---
 name: lanemsg
-description: Two-way chat between you (a Codex or Claude Code orchestrator, or one of its subagents) and the Devin CLI lanes you launch. Use whenever you launch, supervise, message, or answer a Devin lane, or when a "[lanemsg] QUESTION|NOTE|ANSWER from lane ..." message arrives.
+description: Two-way chat between you (a Codex, Claude Code, or Cursor orchestrator, or one of its subagents) and the Devin, Codex, or Cursor CLI lanes you launch. Use whenever you launch, supervise, message, or answer a lane, or when a "[lanemsg] QUESTION|NOTE|ANSWER from lane ..." message arrives.
 ---
 
-# lanemsg: chat with the Devin lanes you launch
+# lanemsg: chat with the Devin, Codex, and Cursor CLI lanes you launch
 
 A lane can ask you a question or report a result while it works, and you can send it notes and questions
-mid-run. `lanemsg` is on PATH on every Trinity node; the full documentation is
-`/data2/jjyeung/claude-devin-chat/README.md`. It adds a chat channel only: keep your project's coordination
-rules (leases, briefs, ledgers, heartbeats) as they are.
+mid-run. `lanemsg` is on PATH. Set `LANEMSG_HOME` to the shared mailbox directory before you register or
+launch a lane. The full documentation is the `README.md` next to `lanemsg.py`. It adds a chat channel only:
+keep your project's coordination rules (leases, briefs, ledgers, heartbeats) as they are.
 
-## Launch every Devin lane through lanemsg
+## Launch every lane through lanemsg
 
-1. Register the lane from your own shell, once. A relative name goes under `/data2/jjyeung/lanemsg/lanes`; an
-   absolute path on `/data2` works too. Registration records your session and thread as the lane's receiver.
+1. Register the lane from your own shell, once. A relative name goes under `$LANEMSG_HOME/lanes`; an
+   absolute path works too. Registration records your session and thread as the lane's receiver.
 
    ```bash
    lanemsg register <run>/<lane>
@@ -28,6 +28,19 @@ rules (leases, briefs, ledgers, heartbeats) as they are.
 
    Devin's `-p` takes the next argument as the prompt, so use `--prompt-file` or put the prompt right after
    `-p`. A lane started without `lanemsg run` cannot chat.
+
+3. A Codex lane has no hooks. Launch it with `lanemsg run <run>/<lane> -- codex ...` and tell it to run
+   `lanemsg inbox` between work steps.
+
+4. A Cursor CLI lane needs `lanemsg install-hooks --cursor` once per account. Those hooks exit immediately
+   outside a lane.
+
+   ```bash
+   lanemsg run <run>/<lane> -- agent -p -f --sandbox disabled --trust --workspace <project> "$(cat <brief>)"
+   ```
+
+   `agent` must resolve to the `cursor-agent` binary. `--sandbox disabled` lets the lane write its mailbox.
+   The lane sees notes at its next prompt or tool call and waits with `lanemsg ask --wait`.
 
 ## Who receives a lane's messages
 
